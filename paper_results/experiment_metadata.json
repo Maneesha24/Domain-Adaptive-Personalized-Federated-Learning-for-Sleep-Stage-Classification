@@ -1,0 +1,46 @@
+{
+  "device": "cpu",
+  "subjects": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "records": [
+    1,
+    2
+  ],
+  "channel": "EEG Fpz-Cz",
+  "epoch_sec": 30,
+  "sfreq": 100,
+  "batch_size": 64,
+  "central_epochs": 10,
+  "fed_rounds": 10,
+  "local_epochs": 1,
+  "personal_epochs": 3,
+  "lr": 0.001,
+  "personal_lr_factor": 0.1,
+  "domain_lambda": 0.1,
+  "seeds": [
+    42,
+    52,
+    62,
+    72,
+    82
+  ],
+  "num_samples": 54498,
+  "num_clients": 20,
+  "class_distribution": {
+    "W": 37115,
+    "N1": 1689,
+    "N2": 8927,
+    "N3": 3074,
+    "REM": 3693
+  }
+}
