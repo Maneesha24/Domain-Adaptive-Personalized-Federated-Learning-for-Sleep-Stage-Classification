@@ -1,164 +1,118 @@
 # Personalized Federated Learning for Sleep Stage Classification
 
-## Author
+**Isha Venigalla** — Software Development Engineer II, Amazon · New York City, USA
 
-**Isha Venigalla**  
-Software Development Engineer II, Amazon  
-New York City, USA
+PyTorch implementation of **Domain-Adaptive Personalized Federated Learning (DA-PFL)** for sleep stage classification on [Sleep-EDF Cassette](https://physionet.org/content/sleep-edfx/1.0.0/). Compares centralized training, FedAvg, personalized FL, and GRL-based domain-adaptive FL with a shared **CNN-BiLSTM** backbone.
+
+**Paper:** [`Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf`](Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf)
 
 ---
 
-A PyTorch implementation of **Domain-Adaptive Personalized Federated Learning (DA-PFL)** for automated sleep stage classification on the [Sleep-EDF Cassette](https://physionet.org/content/sleep-edfx/1.0.0/) dataset. The project compares centralized training, standard FedAvg, client-specific personalization, and domain-adaptive federated learning using a shared **CNN-BiLSTM** backbone.
+## Quick Start
+
+```bash
+cd "/path/to/Personalized Federated Learning"
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python index.py
+```
+
+Default run uses seeds `42`, `52`, `62` and writes artifacts to `paper_results/`. First launch downloads ~1 GB of Sleep-EDF data via MNE.
+
+```bash
+# Faster iteration: skip centralized baseline, verbose logging
+python index.py --skip-centralized --verbose
+
+# Custom seeds / output directory
+python index.py --seeds 42 52 62 72 82 --out-dir my_run
+```
 
 ---
 
 ## Table of Contents
 
-- [Author](#author)
 - [Overview](#overview)
-- [Key Features](#key-features)
+- [Methods](#methods)
 - [Architecture](#architecture)
-- [Methods Compared](#methods-compared)
 - [Project Structure](#project-structure)
-- [Requirements](#requirements)
-- [Installation](#installation)
+- [Requirements & Installation](#requirements--installation)
 - [Usage](#usage)
 - [Configuration](#configuration)
 - [Dataset & Preprocessing](#dataset--preprocessing)
 - [Evaluation Metrics](#evaluation-metrics)
-- [Expected Output](#expected-output)
-- [Saved Models](#saved-models)
+- [Results](#results)
+- [Saved Models & Inference](#saved-models--inference)
+- [Code Documentation](#code-documentation)
 - [Research Context](#research-context)
-- [Limitations](#limitations)
-- [Future Work](#future-work)
+- [Limitations & Future Work](#limitations--future-work)
 - [References](#references)
+- [License](#license)
 
 ---
 
 ## Overview
 
-Sleep stage classification from EEG is essential for diagnosing sleep disorders, but centralized deep learning requires pooling sensitive patient data across institutions. Federated learning (FL) enables collaborative training without sharing raw recordings, yet standard **FedAvg** struggles with **non-IID** (heterogeneous) client data — a common scenario when each client represents a different subject or recording session.
+Sleep stage classification from EEG supports diagnosis of sleep disorders, but centralized deep learning requires pooling sensitive recordings. **Federated learning (FL)** trains collaboratively without sharing raw data, yet **FedAvg** often underperforms when clients are **non-IID** — e.g., each client is a different subject or night.
 
-This project implements and compares several training paradigms on Sleep-EDF:
-
-| Approach | Privacy | Personalization | Domain Adaptation |
+| Approach | Privacy | Personalization | Domain adaptation |
 |----------|---------|-----------------|-------------------|
-| Centralized CNN-BiLSTM | No (pooled data) | N/A | No |
+| Centralized CNN-BiLSTM | No (pooled data) | — | No |
 | FedAvg | Yes | No | No |
-| Personalized FL (no DA) | Yes | Yes (post-federation fine-tuning) | No |
-| DA-PFL (GRL + Personalization) | Yes | Yes | Yes (Gradient Reversal Layer) |
+| Personalized FL (no DA) | Yes | Post-FL fine-tuning | No |
+| **DA-PFL (ours)** | Yes | Post-FL fine-tuning | GRL + domain head |
 
-Each of the 20 Sleep-EDF recording sessions is treated as an independent federated **client**, simulating a multi-institutional deployment where raw EEG never leaves the local device.
+**20 federated clients** — 10 Sleep-EDF subjects × 2 nights per subject. Each recording is one client; raw EEG never leaves the client during training.
+
+All experiments run through **`index.py`**: multi-seed evaluation, checkpoints, CSV/LaTeX export, convergence curves, and per-class reports. The codebase uses detailed NumPy-style docstrings throughout `index.py`.
 
 ---
 
-## Key Features
+## Methods
 
-- **Automatic data download** via MNE's Sleep Physionet API
-- **Single-channel EEG** preprocessing (Fpz-Cz, 30-second epochs)
-- **CNN-BiLSTM** architecture for spectral + temporal feature learning
-- **FedAvg** aggregation with sample-weighted parameter averaging
-- **Client-specific fine-tuning** for personalization after federation
-- **GRL-based adversarial domain adaptation** via a custom `GradientReversalLayer` (Ganin & Lempitsky, ICML 2015)
-- **Domain-adaptive training** with an auxiliary domain discriminator head
-- **Side-by-side comparison** of all methods with Accuracy, Macro-F1, and Cohen's Kappa
-- **Model checkpointing** to the `models/` directory
+### 1. Centralized CNN-BiLSTM (upper bound)
+
+All data pooled; global 80/20 stratified train/test split. Performance ceiling without privacy constraints.
+
+### 2. FedAvg
+
+Standard federated averaging ([McMahan et al., 2017](https://arxiv.org/abs/1602.05629)): each round, clients train locally for `LOCAL_EPOCHS`, upload weights, server applies sample-weighted averaging. One global model evaluated on all clients' test sets.
+
+### 3. Personalized FL (no DA)
+
+After FedAvg, each client fine-tunes the global model for `PERSONAL_EPOCHS` at `LR × PERSONAL_LR_FACTOR`. Classification loss only; no domain head.
+
+### 4. DA-PFL (GRL + personalization)
+
+- **Phase 1 (`run_da_pfl_phase1`):** `DomainAdaptiveCNNBiLSTM` with loss `L_cls + L_dom`. GRL reverses domain gradients into the backbone so features become domain-invariant. FedAvg over `FED_ROUNDS`.
+- **Phase 2 (`run_da_pfl`):** Each client fine-tunes with **classification loss only** (domain logits ignored). Matches the paper protocol: personalization without continued adversarial domain training.
 
 ---
 
 ## Architecture
 
-### CNN-BiLSTM Backbone
+### CNN-BiLSTM backbone
 
 ```
-Input EEG epoch (1 × 3000)
-        │
-        ▼
-┌─────────────────────────────┐
-│  CNN Feature Extractor      │
-│  Conv1d(1→32, k=7) + BN + ReLU + MaxPool │
-│  Conv1d(32→64, k=5) + BN + ReLU + MaxPool │
-│  Conv1d(64→128, k=3) + BN + ReLU + MaxPool │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  Bi-LSTM (64 units × 2)     │
-│  Captures temporal transitions │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  Classification Head          │
-│  Linear(128→64) → ReLU → Dropout(0.3) → Linear(64→5) │
-└─────────────────────────────┘
-        │
-        ▼
-  5-class output (W, N1, N2, N3, REM)
+Input (1 × 3000) → 3× Conv1d blocks (BN, ReLU, MaxPool)
+                 → BiLSTM (64×2, last hidden state 128-d)
+                 → MLP → 5 classes (W, N1, N2, N3, REM)
 ```
 
-### Domain-Adaptive Extension (DA-PFL with GRL)
-
-The `DomainAdaptiveCNNBiLSTM` model splits the shared 128-dimensional feature vector `h` into two heads:
+### DA-PFL extension
 
 ```
-Shared features h (128-d)
-        ├── Classifier head        → sleep stage logits (5 classes)
-        └── GRL(λ) → Domain head  → client identity logits (K=20 clients)
+Backbone features h (128-d)
+  ├─ Classifier → sleep stage (5 classes)
+  └─ GRL(λ) → Domain head → client ID (20 domains)
 ```
 
-The **Gradient Reversal Layer (GRL)** is an identity on the forward pass but negates and scales gradients on the backward pass:
+GRL forward is identity; backward scales gradients by `−λ`:
 
 ```
-GRL_λ(x) = x                          (forward)
-∂GRL_λ/∂x = −λ · I                    (backward)
+L = L_cls + L_dom   →   ∂L/∂θ_backbone = ∂L_cls/∂θ − λ · ∂L_dom/∂θ
 ```
 
-During local training, both heads share a single forward/backward pass with combined loss:
-
-```
-L = L_cls + L_dom
-```
-
-Because gradients from `L_dom` are reversed before reaching the feature extractor, the effective update for the backbone is:
-
-```
-∂L/∂θ = ∂L_cls/∂θ − λ · ∂L_dom/∂θ
-```
-
-The feature extractor is pushed to **minimise** classification error and **maximise** domain confusion — learning domain-invariant representations. The domain discriminator itself receives normal (non-reversed) gradients and continues to distinguish clients, maintaining meaningful adversarial pressure.
-
-This matches the DA-PFL objective. `λ = 0.1` (`DOMAIN_LAMBDA`) is the default GRL reversal scale.
-
----
-
-## Methods Compared
-
-### 1. Centralized CNN-BiLSTM (Upper Bound)
-
-All client data is pooled into a single dataset. An 80/20 stratified train/test split is applied globally. This establishes the performance ceiling when privacy constraints are removed.
-
-### 2. FedAvg
-
-The canonical federated averaging algorithm ([McMahan et al., 2017](https://arxiv.org/abs/1602.05629)):
-
-1. Initialize a global CNN-BiLSTM model
-2. For each federation round:
-   - Each client downloads the global model and trains locally for `LOCAL_EPOCHS` epoch(s)
-   - Clients upload their updated weights (no raw data)
-   - The server aggregates via sample-weighted averaging
-3. Evaluate the global model on all clients' held-out test sets
-
-### 3. Personalized FL (no DA)
-
-After FedAvg completes, each client fine-tunes the global model on its local training data for `PERSONAL_EPOCHS` epochs using a reduced learning rate (`LR × 0.1`). Each client retains its own personalized model for inference. No domain adaptation is applied.
-
-### 4. DA-PFL (GRL + Personalization)
-
-The proposed method combines GRL-based adversarial domain adaptation with post-federation personalization:
-
-- **Phase 1 — Federated training (`run_da_pfl`):** Each client trains a `DomainAdaptiveCNNBiLSTM` locally. Features pass through the GRL before the domain head, so the shared backbone learns domain-invariant representations. Updated weights are aggregated via FedAvg over `FED_ROUNDS` rounds.
-- **Phase 2 — Personalization (`personalize_da_clients`):** Each client fine-tunes the aggregated global model on local data for `PERSONAL_EPOCHS` epochs (reduced LR), retaining both classification and domain losses. No further server communication is required.
+Default `λ = DOMAIN_LAMBDA = 0.1`.
 
 ---
 
@@ -166,284 +120,231 @@ The proposed method combines GRL-based adversarial domain adaptation with post-f
 
 ```
 Personalized Federated Learning/
-├── index.py                          # Main script: data loading, training, evaluation
-├── README.md                         # This file
-├── models/                           # Saved model checkpoints (generated at runtime)
-│   ├── centralized_cnn_bilstm.pt     # Centralized baseline weights
-│   ├── fedavg_sleep_edf.pt           # FedAvg global model weights
-│   ├── da_pfl_grl.pt                 # DA-PFL global model weights (with GRL)
-│   └── sleep_edf_cnn_bilstm.pt       # Additional checkpoint (if present)
+├── index.py                              # Main experiment script
+├── README.md
+├── requirements.txt
+├── Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf
+└── paper_results/                        # Created by index.py (default --out-dir)
+    ├── experiment_metadata.json
+    ├── per_seed_results.csv              # After full multi-seed run
+    ├── summary_mean_std.csv
+    ├── convergence_curves.csv
+    ├── delta_rows.csv
+    ├── latex_table_rows.txt
+    └── seed_<N>/
+        ├── centralized.pt, fedavg.pt, da_pfl_phase1_grl.pt
+        ├── pers_fl_client_<id>.pt, da_pfl_client_<id>.pt
+        └── *_report.txt, *_report.csv
 ```
+
+> **Note:** Checkpoint directories under `paper_results/seed_*` are large (~hundreds of MB per seed). Consider adding `paper_results/` or `*.pt` to `.gitignore` if you do not version trained weights.
 
 ---
 
-## Requirements
+## Requirements & Installation
 
 | Package | Purpose |
 |---------|---------|
 | Python 3.8+ | Runtime |
-| [PyTorch](https://pytorch.org/) | Deep learning framework |
-| [MNE](https://mne.tools/) | EEG/EDF I/O, filtering, epoching |
-| [NumPy](https://numpy.org/) | Numerical operations |
-| [scikit-learn](https://scikit-learn.org/) | Metrics, train/test splitting |
-| [tqdm](https://github.com/tqdm/tqdm) | Progress bars |
-
-A CUDA-capable GPU is recommended but not required — the script automatically falls back to CPU.
-
----
-
-## Installation
-
-### 1. Clone or download this repository
-
-```bash
-cd "/path/to/Personalized Federated Learning"
-```
-
-### 2. Create a virtual environment (recommended)
+| PyTorch | Models and training |
+| MNE | Sleep-EDF download, filtering, epoching |
+| NumPy, pandas | Arrays and result tables |
+| scikit-learn | Metrics and stratified splits |
+| tqdm | Progress bars |
 
 ```bash
 python -m venv venv
-source venv/bin/activate        # macOS / Linux
-# venv\Scripts\activate         # Windows
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 3. Install dependencies
-
-```bash
-pip install torch numpy mne scikit-learn tqdm
-```
-
-For GPU support, install PyTorch with the appropriate CUDA build from [pytorch.org](https://pytorch.org/get-started/locally/).
-
-### 4. Verify MNE can access Sleep-EDF
-
-The first run will automatically download ~1 GB of Sleep-EDF data via MNE's dataset fetcher. Ensure you have a stable internet connection and sufficient disk space.
+Install a [CUDA-enabled PyTorch](https://pytorch.org/get-started/locally/) build for GPU training. The script uses `"cuda"` when available, otherwise `"cpu"`.
 
 ---
 
 ## Usage
 
-Run the full training and evaluation pipeline:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--seeds` | `42 52 62` | Random seeds (space-separated) |
+| `--out-dir` | `paper_results` | Output root for CSVs and checkpoints |
+| `--skip-centralized` | off | Skip centralized upper bound |
+| `--verbose` | off | Per-epoch / per-round logging |
 
-```bash
-python index.py
-```
+**Per seed**, `run_all_experiments` in `index.py`:
 
-The script executes the following steps in order:
+1. Loads Sleep-EDF (20 clients)
+2. Stratified 80/20 split per client
+3. Centralized baseline (optional)
+4. FedAvg → Personalized FL
+5. DA-PFL Phase 1 → Phase 2
+6. Saves checkpoints and classification reports under `seed_<N>/`
 
-1. Download and preprocess Sleep-EDF data (10 subjects × 2 recordings = 20 clients)
-2. Train and evaluate the **centralized baseline**
-3. Split data per client (80/20 stratified train/test)
-4. Run **FedAvg** federated training
-5. Apply **personalized fine-tuning** on the FedAvg global model (no domain adaptation)
-6. Run **DA-PFL** federated training with GRL-based domain adaptation
-7. Apply **personalized fine-tuning** on the DA-PFL global model
-8. Print a final comparison table of all methods
-9. Save model checkpoints to `models/`
-
-Training progress is printed to stdout, including per-round metrics for federated methods and per-epoch metrics for the centralized baseline.
+**After all seeds:** writes aggregate CSVs, LaTeX rows, delta table, and prints the multi-seed summary.
 
 ---
 
 ## Configuration
 
-All hyperparameters are defined at the top of `index.py`:
+Edit constants at the top of `index.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `SUBJECTS` | `[0..9]` | Sleep-EDF subject IDs to include |
-| `RECORDS` | `[1, 2]` | Recording sessions per subject |
-| `CHANNEL` | `"EEG Fpz-Cz"` | EEG channel used for classification |
-| `EPOCH_SEC` | `30` | Epoch duration in seconds |
-| `SFREQ` | `100` | Target sampling frequency (Hz) |
+| `SUBJECTS` | `0..9` | Sleep-EDF subjects |
+| `RECORDS` | `[1, 2]` | Nights per subject |
+| `CHANNEL` | `EEG Fpz-Cz` | Input channel |
+| `EPOCH_SEC` / `SFREQ` | `30` / `100` | Epoch length; 3000 samples/epoch |
 | `BATCH_SIZE` | `64` | Mini-batch size |
-| `CENTRAL_EPOCHS` | `10` | Epochs for centralized training |
-| `FED_ROUNDS` | `10` | Number of federation rounds |
-| `LOCAL_EPOCHS` | `1` | Local training epochs per federation round |
-| `PERSONAL_EPOCHS` | `3` | Personalization fine-tuning epochs |
-| `LR` | `1e-3` | Base Adam learning rate |
-| `DOMAIN_LAMBDA` | `0.1` | GRL reversal scale λ (domain adaptation strength) |
-| `DEVICE` | auto | `"cuda"` if available, else `"cpu"` |
+| `CENTRAL_EPOCHS` | `10` | Centralized training epochs |
+| `FED_ROUNDS` | `10` | Federation rounds |
+| `LOCAL_EPOCHS` | `1` | Local epochs per FedAvg round |
+| `PERSONAL_EPOCHS` | `3` | Personalization epochs |
+| `LR` | `1e-3` | Adam learning rate |
+| `PERSONAL_LR_FACTOR` | `0.1` | Personalization LR scale |
+| `DOMAIN_LAMBDA` | `0.1` | GRL strength λ |
+| `DEFAULT_SEEDS` | `[42, 52, 62]` | Overridden by `--seeds` |
 
-To experiment with fewer subjects (faster iteration), modify `SUBJECTS`:
-
-```python
-SUBJECTS = list(range(3))   # Use only 3 subjects (6 clients)
-```
+Smaller ablation: `SUBJECTS = list(range(3))` → 6 clients, faster runs.
 
 ---
 
 ## Dataset & Preprocessing
 
-### Sleep-EDF Cassette Dataset
+- **54,498** epochs after preprocessing (10 subjects × 2 nights × ~2.7k epochs/night)
+- **Labels:** W, N1, N2, N3 (S3+S4 merged), REM — see `ANNOTATION_DESC_2_ID` in `index.py`
+- **Pipeline:** load EDF → Fpz-Cz → 0.3–35 Hz band-pass → resample 100 Hz → 30 s epochs → per-epoch z-score → stratified client split
 
-- **Source:** [PhysioNet Sleep-EDF Expanded](https://physionet.org/content/sleep-edfx/1.0.0/)
-- **Subjects:** 10 healthy adults (ages 25–101)
-- **Recordings:** 2 nights per subject → **20 federated clients**
-- **Total epochs:** ~54,498 labeled 30-second segments (after preprocessing)
+| Stage | Count | Share |
+|-------|-------|-------|
+| W | 37,115 | 68% |
+| N1 | 1,689 | 3% |
+| N2 | 8,927 | 16% |
+| N3 | 3,074 | 6% |
+| REM | 3,693 | 7% |
 
-### Sleep Stage Labels
-
-Stages follow the American Academy of Sleep Medicine (AASM) convention, mapped to 5 classes:
-
-| Label ID | Stage | Description |
-|----------|-------|-------------|
-| 0 | W | Wake |
-| 1 | N1 | Light sleep (Stage 1) |
-| 2 | N2 | Light sleep (Stage 2) |
-| 3 | N3 | Deep sleep (Stages 3 + 4 merged) |
-| 4 | REM | Rapid Eye Movement |
-
-> Stages 3 and 4 are merged into a single N3 class, following common practice in sleep staging literature.
-
-### Preprocessing Pipeline
-
-1. Load PSG (polysomnography) and hypnogram (annotation) EDF files
-2. Select the **EEG Fpz-Cz** channel
-3. Band-pass filter: **0.3–35 Hz** (FIR, Hamming window)
-4. Resample to **100 Hz** (3,000 samples per 30-second epoch)
-5. Segment into non-overlapping 30-second epochs aligned with annotation boundaries
-6. **Per-epoch z-score normalization:** `(x - μ) / (σ + 1e-8)`
-7. **Stratified 80/20 train/test split** per client
-
-### Class Distribution (Approximate)
-
-| Stage | Percentage |
-|-------|------------|
-| W (Wake) | ~68% |
-| N1 | ~3% |
-| N2 | ~16% |
-| N3 | ~6% |
-| REM | ~7% |
-
-The dataset is heavily imbalanced toward Wake and N2 stages. Macro-F1 is used as a primary metric because it gives equal weight to all classes, including minority stages like N1.
+Macro-F1 is emphasized because accuracy is dominated by Wake/N2.
 
 ---
 
 ## Evaluation Metrics
 
-All methods are evaluated on held-out test data using three metrics:
+| Metric | Role |
+|--------|------|
+| **Accuracy** | Overall correct epochs |
+| **Macro F1** | Equal weight per stage; highlights N1/REM |
+| **Cohen's κ** | Chance-corrected agreement |
 
-| Metric | Description |
-|--------|-------------|
-| **Accuracy** | Overall fraction of correctly classified epochs |
-| **Macro F1** | Unweighted mean F1 across all 5 sleep stages; sensitive to minority-class performance |
-| **Cohen's Kappa (κ)** | Agreement corrected for chance; κ > 0.80 indicates "almost perfect" agreement (Landis & Koch scale) |
-
-For federated methods, predictions from all clients' test sets are aggregated before computing global metrics.
+Federated metrics pool predictions across all clients' **test** sets before scoring.
 
 ---
 
-## Expected Output
+## Results
 
-After running `python index.py`, you will see training logs for each method followed by a comparison table:
+### Multi-seed summary (seeds 42, 52, 62)
+
+Derived from pooled test-set classification reports in `paper_results/seed_*/`. Re-run `python index.py` to refresh and populate `summary_mean_std.csv` with κ and exact aggregates.
+
+| Method | Accuracy | Macro F1 |
+|--------|----------|----------|
+| Centralized CNN-BiLSTM | 0.9300 ± 0.0000 | 0.7333 ± 0.0208 |
+| FedAvg | 0.8267 ± 0.0289 | 0.5400 ± 0.0300 |
+| Pers. FL (no DA) | 0.9167 ± 0.0058 | 0.6800 ± 0.0000 |
+| **DA-PFL (ours)** | **0.9167 ± 0.0058** | **0.6800 ± 0.0100** |
+
+DA-PFL reaches the same pooled accuracy as Personalized FL while Phase 1 learns domain-invariant representations via GRL. FedAvg lags on macro-F1 due to non-IID client drift. Centralized training remains the upper bound (~93% accuracy).
+
+### Example console output
 
 ```
-========== Final Comparison ==========
-Model                                         |   Accuracy |   Macro-F1 |      Kappa
--------------------------------------------------------------------------------------
-Centralized CNN-BiLSTM                        |     0.9318 |     0.7604 |     0.8633
-FedAvg                                        |     0.8301 |     0.5498 |     0.6801
-Personalized FL (no DA)                       |     0.9161 |     0.6769 |     0.8316
-DA-PFL (GRL + Personalization)                |     0.9238 |     0.6989 |     0.8461
+================================================================================
+FINAL MULTI-SEED SUMMARY
+================================================================================
+                  method  accuracy_mean  accuracy_std  macro_f1_mean  macro_f1_std  kappa_mean  kappa_std  n_seeds
+...
 ```
 
-> Actual numbers may vary slightly between runs due to hardware, data download versions, and random initialization. This script runs once with a fixed random seed (`random_state=42` in `train_test_split`).
-
-### Reference Results (5-run average)
-
-| Method | Accuracy | Macro F1 | Kappa |
-|--------|----------|----------|-------|
-| Centralized | 0.9318 ± 0.0021 | 0.7604 ± 0.0038 | 0.8633 ± 0.0025 |
-| FedAvg | 0.8301 ± 0.0084 | 0.5498 ± 0.0112 | 0.6801 ± 0.0097 |
-| Personalized FL | 0.9161 ± 0.0033 | 0.6769 ± 0.0051 | 0.8316 ± 0.0041 |
-| **DA-PFL (ours)** | **0.9238 ± 0.0028** | **0.6989 ± 0.0044** | **0.8461 ± 0.0035** |
-
-DA-PFL closes the accuracy gap to the centralized upper bound to within **0.80%** while preserving full data privacy.
+LaTeX table rows: `paper_results/latex_table_rows.txt` · DA-PFL deltas: `paper_results/delta_rows.csv`
 
 ---
 
-## Saved Models
+## Saved Models & Inference
 
-After a successful run, the following checkpoints are written to `models/`:
-
-| File | Description |
-|------|-------------|
-| `centralized_cnn_bilstm.pt` | Centralized baseline CNN-BiLSTM state dict |
-| `fedavg_sleep_edf.pt` | Global FedAvg model after all federation rounds |
-| `da_pfl_grl.pt` | Global DA-PFL model after federation (includes GRL + domain head) |
-
-To load a saved model for inference:
+| Checkpoint | Description |
+|------------|-------------|
+| `centralized.pt` | Pooled-data upper bound |
+| `fedavg.pt` | Global FedAvg weights |
+| `da_pfl_phase1_grl.pt` | Global model after Phase 1 |
+| `pers_fl_client_<id>.pt` | Personalized FL, client `id` |
+| `da_pfl_client_<id>.pt` | DA-PFL after Phase 2 |
 
 ```python
 import torch
-from index import CNNBiLSTM, DomainAdaptiveCNNBiLSTM, DEVICE
+from index import CNNBiLSTM, DomainAdaptiveCNNBiLSTM, DEVICE, evaluate_domain_model
 
-# FedAvg or centralized model
+SEED = 42
+path = f"paper_results/seed_{SEED}"
+
+# FedAvg global model
 model = CNNBiLSTM(num_classes=5).to(DEVICE)
-model.load_state_dict(torch.load("models/fedavg_sleep_edf.pt", map_location=DEVICE))
+model.load_state_dict(torch.load(f"{path}/fedavg.pt", map_location=DEVICE, weights_only=True))
 model.eval()
 
-# DA-PFL model (use class_logits only at inference time)
-da_model = DomainAdaptiveCNNBiLSTM(num_classes=5, num_domains=20).to(DEVICE)
-da_model.load_state_dict(torch.load("models/da_pfl_grl.pt", map_location=DEVICE))
-da_model.eval()
+# DA-PFL personalized client 0
+client = DomainAdaptiveCNNBiLSTM(num_classes=5, num_domains=20, lam=0.1).to(DEVICE)
+client.load_state_dict(torch.load(f"{path}/da_pfl_client_0.pt", map_location=DEVICE, weights_only=True))
+client.eval()
 ```
 
-For evaluation of the DA-PFL model, use `evaluate_domain_model()` which ignores domain logits.
+For DA-PFL evaluation, use `evaluate_domain_model()` so only sleep-stage logits are used.
+
+---
+
+## Code Documentation
+
+`index.py` documents the full pipeline with NumPy-style docstrings (parameters, returns, notes, cross-references).
+
+| Symbol | Role |
+|--------|------|
+| `load_sleep_edf`, `split_clients` | Data loading and partitioning |
+| `CNNBiLSTM`, `DomainAdaptiveCNNBiLSTM`, `GradientReversalLayer` | Models |
+| `run_centralized`, `run_fedavg`, `run_personalized_fl` | Baselines |
+| `run_da_pfl_phase1`, `run_da_pfl` | DA-PFL phases |
+| `run_all_experiments`, `parse_args` | CLI entry |
+
+```bash
+python -c "import index; help(index.run_da_pfl_phase1)"
+```
 
 ---
 
 ## Research Context
 
-This implementation supports the DA-PFL framework. The key ideas are:
+1. **Privacy:** Only model weights cross the network during federation.
+2. **Domain invariance:** GRL encourages features that confuse the domain (client) classifier while preserving sleep-stage signal.
+3. **Personalization:** Short local fine-tuning adapts to subject/night-specific patterns without extra server rounds.
 
-1. **Privacy preservation:** Raw EEG never leaves the local client; only model weights are shared.
-2. **GRL-based domain adaptation:** A Gradient Reversal Layer between the shared features and the domain discriminator forces the backbone to learn domain-invariant representations via adversarial training.
-3. **Personalization:** Lightweight post-federation fine-tuning adapts the global model to each client's individual sleep patterns without additional server communication.
-
-### Communication Overhead
-
-Only model parameters are transmitted during federation (~1.6 MB per client per round). Over 20 clients and 10 rounds, total uplink is ~326 MB — orders of magnitude less than uploading the raw ~4.3 GB dataset.
+**Communication cost:** ~1.6 MB per client per round × 20 clients × 10 rounds ≈ 326 MB of weight updates vs. ~4.3 GB of raw EEG.
 
 ---
 
-## Limitations
+## Limitations & Future Work
 
-- **Simulated clients:** Each Sleep-EDF recording session stands in for a real institution. True multi-institutional FL would involve varying equipment, demographics, and protocols.
-- **Single EEG channel:** Using only Fpz-Cz limits performance on minority stages (N1, REM). Multimodal inputs (EOG, EMG) would likely improve results.
-- **Class imbalance:** N1 stages (~3% of data) remain difficult even for the centralized model (F1 ≈ 0.30).
-- **FedProx not implemented:** FedProx is a common FL baseline for non-IID data but is not included in `index.py`.
-- **Single run:** The script uses a fixed random seed and does not perform multi-seed averaging. For publication-grade reproducibility, run with multiple seeds and report mean ± std.
-- **Personalized model checkpoints:** Only global models are saved to disk; per-client personalized models exist in memory during evaluation but are not persisted.
+**Limitations:** Simulated clients (not true multi-site cohorts); single EEG channel; severe N1 imbalance; FedProx and other FL baselines not implemented; multi-seed runs are CPU/GPU intensive.
 
----
-
-## Future Work
-
-- Add FedProx and other FL baselines (SCAFFOLD, MOON)
-- Multi-seed evaluation with confidence intervals
-- Class-imbalance remedies (weighted loss, focal loss, SMOTE)
-- Multi-channel / multimodal inputs (EEG + EOG + EMG)
-- Transformer-based temporal encoders
-- Real multi-institutional validation on clinical cohorts
+**Future work:** FedProx / SCAFFOLD / MOON baselines; class-weighted or focal loss; multimodal inputs; transformers; clinical multi-site validation; CLI flags for `FED_ROUNDS` and hyperparameter sweeps.
 
 ---
 
 ## References
 
-1. McMahan, B., et al. "Communication-Efficient Learning of Deep Networks from Decentralized Data." *AISTATS*, 2017.
-2. Chambon, S., et al. "A Deep Learning Architecture for Temporal Sleep Stage Classification Using Multivariate and Multimodal Time Series." *IEEE TNSRE*, 2018.
-3. Zhu, X., et al. "Sleep Stage Classification Based on EEG, EOG, and CNN-GRU Deep Learning Model." *IEEE ICAWST*, 2019.
-4. Loh, H. W., et al. "Automated Detection of Sleep Stages Using Deep Learning Techniques: A Systematic Review." *Applied Sciences*, 2020.
-5. Ganin, Y., & Lempitsky, V. "Unsupervised Domain Adaptation by Back-Propagation." *ICML*, 2015.
-6. Smith, V., et al. "Federated Multi-Task Learning." *NeurIPS*, 2017.
-7. Li, T., et al. "Federated Optimization in Heterogeneous Networks." *MLSys*, 2020. (FedProx)
-8. Goldberger, A. L., et al. "PhysioBank, PhysioToolkit, and PhysioNet." *Circulation*, 2000. (Sleep-EDF)
+1. McMahan et al., *Communication-Efficient Learning of Deep Networks from Decentralized Data*, AISTATS 2017.
+2. Ganin & Lempitsky, *Unsupervised Domain Adaptation by Back-Propagation*, ICML 2015.
+3. Chambon et al., *IEEE TNSRE*, 2018 — deep learning sleep staging.
+4. Goldberger et al., *Circulation*, 2000 — PhysioNet / Sleep-EDF.
+5. Li et al., *FedProx*, MLSys 2020.
 
 ---
 
 ## License
 
-This project is provided for research and educational purposes. Sleep-EDF data is subject to the [PhysioNet Credentialed Health Data License](https://physionet.org/content/sleep-edfx/view-license/1.0.0/).
+Research and educational use. Sleep-EDF is under the [PhysioNet license](https://physionet.org/content/sleep-edfx/view-license/1.0.0/).
