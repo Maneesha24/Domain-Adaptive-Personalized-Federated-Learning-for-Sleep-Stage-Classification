@@ -1,198 +1,298 @@
 """
-Personalized Federated Learning for Sleep Stage Classification.
+Domain-Adaptive Personalized Federated Learning for Sleep Stage Classification
+----------------------------------------------------------------------------
 
-This module implements and compares four learning paradigms on the Sleep-EDF
-(PhysioNet) dataset:
+Final experiment script for the paper.
 
-    1. **Centralized CNN-BiLSTM** — upper-bound baseline with pooled data.
-    2. **FedAvg** — standard federated averaging across per-subject clients.
-    3. **Personalized FL** — FedAvg global model + per-client fine-tuning.
-    4. **DA-PFL** — domain-adaptive federated learning with a Gradient
-       Reversal Layer (GRL) for domain-invariant features, followed by
-       client personalization.
+Runs:
+1. Centralized CNN-BiLSTM upper bound
+2. FedAvg
+3. Personalized FL = FedAvg + client-specific fine-tuning
+4. DA-PFL = GRL-based domain-adaptive FL + fixed Phase-2 personalization
 
-Each client corresponds to one subject's recordings. EEG epochs are extracted
-from a single channel (Fpz-Cz), band-pass filtered, resampled, and z-scored
-before being fed into a shared CNN-BiLSTM backbone.
+Key paper-aligned details:
+- Sleep-EDF Cassette, 10 subjects x 2 nights = 20 simulated clients
+- Each recording is treated as one federated client
+- Phase 1 DA-PFL uses classification + domain loss with GRL
+- Phase 2 DA-PFL uses classification loss only; no domain loss
+- Multi-seed evaluation with mean ± std
+- Saves CSV results, LaTeX table rows, convergence curves, and per-class reports
 
-References
-----------
-    Ganin, Y., & Lempitsky, V. (2015). Unsupervised domain adaptation by
-    backpropagation. *ICML*.
-
-Usage
------
+Usage:
     python index.py
 
-Trained model checkpoints are written to the ``models/`` directory.
+Optional:
+    python index.py --seeds 42 52 62
+    python index.py --fed-rounds 10
+    python index.py --skip-centralized
+
+Dependencies:
+    pip install torch torchvision torchaudio mne scikit-learn numpy pandas tqdm
 """
 
-import os
+import argparse
 import copy
+import json
+import os
+import random
 import warnings
-import numpy as np
+from pathlib import Path
+
 import mne
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
 from torch.autograd import Function
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import (
-    accuracy_score, f1_score, cohen_kappa_score, classification_report
+    accuracy_score,
+    f1_score,
+    cohen_kappa_score,
+    classification_report,
 )
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
+
 # =============================================================================
-# Config
+# Defaults
 # =============================================================================
-# Global hyperparameters and label mappings for Sleep-EDF preprocessing
-# and all training/evaluation pipelines.
+#
+# Module-level hyperparameters and label mappings for Sleep-EDF Cassette
+# experiments. These values are written to experiment_metadata.json and
+# should stay aligned with the paper protocol unless ablation flags are added.
 
-# --- Data / preprocessing ---
-SUBJECTS = list(range(10))   # PhysioNet subject IDs 0–9
-RECORDS  = [1, 2]            # Two PSG recordings per subject
-CHANNEL  = "EEG Fpz-Cz"      # Single-channel montage used for classification
-EPOCH_SEC = 30               # Hypnogram epoch length (seconds)
-SFREQ     = 100              # Target sampling rate after resampling (Hz)
+SUBJECTS = list(range(10))
+RECORDS = [1, 2]
+CHANNEL = "EEG Fpz-Cz"
+EPOCH_SEC = 30
+SFREQ = 100
 
-# --- Training schedule ---
-BATCH_SIZE      = 64         # Mini-batch size for all DataLoaders
-CENTRAL_EPOCHS  = 10         # Epochs for centralized upper-bound baseline
-FED_ROUNDS      = 10         # Federated communication rounds (FedAvg / DA-PFL)
-LOCAL_EPOCHS    = 1          # Local epochs per client per federated round
-PERSONAL_EPOCHS = 3          # Client fine-tuning epochs after federation
+BATCH_SIZE = 64
+CENTRAL_EPOCHS = 10
+FED_ROUNDS = 10
+LOCAL_EPOCHS = 1
+PERSONAL_EPOCHS = 3
 
-# --- Optimisation ---
-LR            = 1e-3         # Adam learning rate (local & centralized)
-DOMAIN_LAMBDA = 0.1          # GRL reversal scale λ (DA-PFL adversarial strength)
+LR = 1e-3
+PERSONAL_LR_FACTOR = 0.1
+DOMAIN_LAMBDA = 0.1
 
+DEFAULT_SEEDS = [42, 52, 62]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Maps PhysioNet annotation strings → integer class IDs (N3/N4 merged).
+# Maps Sleep-EDF hypnogram annotation strings to integer class IDs (N3/N4 merged).
 ANNOTATION_DESC_2_ID = {
     "Sleep stage W": 0,
     "Sleep stage 1": 1,
     "Sleep stage 2": 2,
     "Sleep stage 3": 3,
-    "Sleep stage 4": 3,   # merged into N3
+    "Sleep stage 4": 3,
     "Sleep stage R": 4,
 }
-# Human-readable stage names for classification reports.
-ID_2_LABEL = {0: "W", 1: "N1", 2: "N2", 3: "N3", 4: "REM"}
+
+# Human-readable stage names for reports and metadata (5 classes).
+ID_2_LABEL = {
+    0: "W",
+    1: "N1",
+    2: "N2",
+    3: "N3",
+    4: "REM",
+}
 
 
 # =============================================================================
-# Gradient Reversal Layer  (Ganin & Lempitsky, ICML 2015)
+# Reproducibility
 # =============================================================================
+
+def set_seed(seed: int) -> None:
+    """
+    Fix random number generators for reproducible training and evaluation.
+
+    Seeds Python ``random``, NumPy, and PyTorch (CPU and all CUDA devices).
+    Enables deterministic cuDNN kernels and disables benchmark mode so that
+    convolution algorithms do not vary across runs. Attempts to enable
+    PyTorch's deterministic-algorithms mode when supported.
+
+    Parameters
+    ----------
+    seed : int
+        Integer seed applied to all RNG backends for the current run.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Full bitwise reproducibility on GPU may still vary slightly across
+    hardware/driver versions even with these settings.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Gradient Reversal Layer
+# =============================================================================
+
 class _GradientReversalFunction(Function):
     """
-    Custom autograd function implementing the Gradient Reversal Layer (GRL).
+    Autograd function implementing the gradient reversal operator (GRL).
 
-    During the forward pass the input is passed through unchanged (identity).
-    During the backward pass gradients w.r.t. the input are negated and scaled
-    by ``lam``, so upstream layers effectively *maximize* domain loss while
-    downstream layers *minimize* it.
+    During the forward pass the input is passed through unchanged. During
+    backpropagation, gradients w.r.t. the input are multiplied by ``-lam``,
+    which encourages the feature extractor to produce domain-invariant
+    representations while the domain head still minimizes domain classification
+    loss (adversarial domain adaptation).
 
-    @see GradientReversalLayer
-    @see DomainAdaptiveCNNBiLSTM
+    See Also
+    --------
+    GradientReversalLayer : ``nn.Module`` wrapper used in DomainAdaptiveCNNBiLSTM.
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, lam: float) -> torch.Tensor:
+    def forward(ctx, x, lam):
         """
-        Identity forward: output equals input.
+        Identity forward pass; stores ``lam`` for the backward hook.
 
-        @param ctx: Autograd context; stores ``lam`` for backward.
-        @param x: Feature tensor of shape ``(B, D)``.
-        @param lam: Reversal scale λ (scalar); controls adversarial strength.
-        @return: Clone of ``x`` (same shape as input).
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Context object for saving tensors and scalars for backward.
+        x : torch.Tensor
+            Feature tensor from the shared backbone.
+        lam : float
+            Gradient reversal strength (domain-adaptation trade-off).
+
+        Returns
+        -------
+        torch.Tensor
+            Same tensor as ``x`` (shape preserved via ``view_as``).
         """
-        ctx.save_for_backward(torch.tensor(lam))
-        return x.clone()
+        ctx.lam = lam
+        return x.view_as(x)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output):
         """
-        Reverse and scale gradients flowing into shared features.
+        Reverse and scale gradients flowing into the feature extractor.
 
-        @param ctx: Autograd context with saved ``lam``.
-        @param grad_output: Upstream gradient from domain head, shape matches ``x``.
-        @return: Tuple ``(grad_input, None)`` where ``grad_input = -λ * grad_output``
-                 and the second element is ``None`` (``lam`` is not differentiable).
+        Parameters
+        ----------
+        ctx : torch.autograd.function.FunctionCtx
+            Context with ``lam`` saved in forward.
+        grad_output : torch.Tensor
+            Upstream gradient from the domain classifier.
+
+        Returns
+        -------
+        tuple[torch.Tensor, None]
+            Scaled negative gradient for ``x``; ``None`` for non-differentiable ``lam``.
         """
-        (lam,) = ctx.saved_tensors
-        return -lam.item() * grad_output, None
+        return -ctx.lam * grad_output, None
 
 
 class GradientReversalLayer(nn.Module):
     """
-    ``nn.Module`` wrapper around :class:`_GradientReversalFunction`.
+    Gradient Reversal Layer (GRL) for adversarial domain adaptation.
 
-    Inserts adversarial domain adaptation between a shared feature extractor
-    and a domain classifier. Feature layers upstream of this module receive
-    reversed domain gradients; the domain head receives normal gradients.
+    Wraps :class:`_GradientReversalFunction` so it can be inserted between the
+    shared CNN-BiLSTM backbone and the domain classifier in DA-PFL Phase 1.
 
-    @param lam: Reversal scale λ (default 1.0). Larger values strengthen
-                domain-invariance pressure on the backbone.
+    Parameters
+    ----------
+    lam : float, default=1.0
+        Multiplier applied to reversed gradients during backpropagation.
+        Larger values strengthen the push toward domain-invariant features.
+
+    Attributes
+    ----------
+    lam : float
+        Current reversal strength (matches ``DOMAIN_LAMBDA`` in experiments).
+
+    See Also
+    --------
+    DomainAdaptiveCNNBiLSTM : End-to-end model using this layer.
     """
 
     def __init__(self, lam: float = 1.0):
-        """
-        @param lam: Gradient reversal multiplier (λ in Ganin & Lempitsky, 2015).
-        """
         super().__init__()
         self.lam = lam
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
         Apply gradient reversal on the backward pass only.
 
-        @param x: Shared features ``h`` of shape ``(batch, 128)``.
-        @return: Same tensor as ``x`` in the forward pass.
+        Parameters
+        ----------
+        x : torch.Tensor
+            Backbone features of shape ``(batch, 128)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Unmodified features (identity in forward).
         """
         return _GradientReversalFunction.apply(x, self.lam)
 
-    def extra_repr(self) -> str:
-        """@return: Human-readable representation of λ."""
-        return f"lambda={self.lam}"
-
 
 # =============================================================================
-# Dataset Loading
+# Dataset loading
 # =============================================================================
+
 def load_sleep_edf(subjects=SUBJECTS, records=RECORDS):
     """
-    Download, preprocess, and concatenate Sleep-EDF recordings into arrays.
+    Download (if needed), preprocess, and concatenate Sleep-EDF Cassette data.
 
-    For each subject/recording pair the pipeline: fetches EDF + hypnogram,
-    annotates sleep stages, selects ``CHANNEL``, filters 0.3–35 Hz, resamples
-    to ``SFREQ`` Hz, segments into ``EPOCH_SEC``-second epochs, and applies
-    per-epoch z-score normalization along the time axis.
+    Each subject-night recording becomes one federated client. EEG is taken from
+    channel ``EEG Fpz-Cz``, band-pass filtered (0.3–35 Hz), resampled to
+    ``SFREQ`` Hz, and segmented into 30-second epochs. Stages N3 and N4 are
+    merged into class 3. Per-epoch z-score normalization is applied along time.
 
-    @param subjects: List of PhysioNet subject indices (default ``SUBJECTS``).
-    @param records: List of recording indices per subject (default ``RECORDS``).
-    @return: Tuple ``(X, y, client_ids)`` where
-             - ``X``: float32 array ``(N, 1, T)`` — EEG epochs (1 channel).
-             - ``y``: int64 array ``(N,)`` — stage labels in ``[0, 4]``.
-             - ``client_ids``: int array ``(N,)`` — federated client index per epoch.
-    @raises ImportError: If ``mne`` sleep_physionet dataset helpers are unavailable.
-    @note Stages 3 and 4 are merged into class 3 (N3) via ``ANNOTATION_DESC_2_ID``.
+    Parameters
+    ----------
+    subjects : list[int], default=SUBJECTS
+        Subject indices passed to MNE's ``fetch_data`` (0–9 for Cassette).
+    records : list[int], default=RECORDS
+        Recording indices per subject (typically nights 1 and 2).
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        ``X`` : float32 array of shape ``(N, 1, 3000)`` — one channel, 30 s @ 100 Hz.
+        ``y`` : int64 array of shape ``(N,)`` — sleep stage labels in ``[0, 4]``.
+        ``client_ids`` : int64 array of shape ``(N,)`` — client index per epoch.
+
+    Notes
+    -----
+    First invocation may download data via ``mne.datasets.sleep_physionet``.
+    Label mapping is defined in :data:`ANNOTATION_DESC_2_ID`.
     """
     from mne.datasets.sleep_physionet.age import fetch_data
 
     X_all, y_all, client_ids = [], [], []
     files = fetch_data(subjects=subjects, recording=records)
 
-    for client_idx, file_pair in enumerate(files):
-        psg_file, hyp_file = file_pair
-
+    for client_idx, (psg_file, hyp_file) in enumerate(files):
         raw = mne.io.read_raw_edf(psg_file, preload=True, verbose=False)
         annot = mne.read_annotations(hyp_file)
-        raw.set_annotations(annot, emit_warning=False)
 
+        raw.set_annotations(annot, emit_warning=False)
         raw.pick([CHANNEL])
         raw.filter(0.3, 35.0, fir_design="firwin", verbose=False)
         raw.resample(SFREQ, verbose=False)
@@ -205,15 +305,20 @@ def load_sleep_edf(subjects=SUBJECTS, records=RECORDS):
         )
 
         epochs = mne.Epochs(
-            raw, events, event_id=event_id,
-            tmin=0, tmax=EPOCH_SEC - 1.0 / SFREQ,
-            baseline=None, preload=True, verbose=False,
+            raw,
+            events,
+            event_id=event_id,
+            tmin=0,
+            tmax=EPOCH_SEC - 1.0 / SFREQ,
+            baseline=None,
+            preload=True,
+            verbose=False,
         )
 
-        X = epochs.get_data()
+        X = epochs.get_data()  # shape: N x 1 x 3000
         y = epochs.events[:, -1]
 
-        # per-epoch z-score normalisation
+        # Per-epoch z-score normalization.
         X = (X - X.mean(axis=2, keepdims=True)) / (
             X.std(axis=2, keepdims=True) + 1e-8
         )
@@ -229,690 +334,1432 @@ def load_sleep_edf(subjects=SUBJECTS, records=RECORDS):
     )
 
 
-# =============================================================================
-# Dataset Class
-# =============================================================================
 class SleepDataset(Dataset):
     """
-    PyTorch ``Dataset`` for preprocessed Sleep-EDF epoch tensors.
+    PyTorch ``Dataset`` wrapper for preprocessed sleep epoch arrays.
 
-    Wraps in-memory NumPy arrays as ``float32`` features and ``long`` labels
-    suitable for ``DataLoader`` batching.
+    Parameters
+    ----------
+    X : array-like
+        Epoch features, typically shape ``(N, 1, 3000)``.
+    y : array-like
+        Integer sleep-stage labels aligned with ``X``.
 
-    @param X: EEG epochs, shape ``(N, 1, time_steps)`` or ``(N, C, T)``.
-    @param y: Integer sleep-stage labels, shape ``(N,)``.
+    Attributes
+    ----------
+    X : torch.Tensor
+        Float32 tensor of EEG epochs.
+    y : torch.Tensor
+        Long tensor of class indices.
     """
 
     def __init__(self, X, y):
-        """
-        @param X: Feature array (converted to ``torch.float32``).
-        @param y: Label array (converted to ``torch.long``).
-        """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
 
     def __len__(self):
-        """@return: Number of epochs in the dataset."""
+        """Return the number of epochs in the dataset."""
         return len(self.y)
 
     def __getitem__(self, idx):
         """
-        @param idx: Sample index in ``[0, len(self))``.
-        @return: Tuple ``(X[idx], y[idx])`` of tensors.
+        Fetch one epoch and its label.
+
+        Parameters
+        ----------
+        idx : int
+            Sample index.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            ``(X[idx], y[idx])`` for use in ``DataLoader``.
         """
         return self.X[idx], self.y[idx]
 
 
+def split_clients(X, y, client_ids, seed: int, test_size: float = 0.2):
+    """
+    Build per-client train and test ``SleepDataset`` splits.
+
+    Applies a stratified hold-out split independently for each client so that
+    class proportions are preserved in both partitions (paper: 80/20 per client).
+
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Full feature matrix from :func:`load_sleep_edf`.
+    y : numpy.ndarray
+        Full label vector.
+    client_ids : numpy.ndarray
+        Client index for each sample.
+    seed : int
+        Random seed for ``sklearn.model_selection.train_test_split``.
+    test_size : float, default=0.2
+        Fraction of each client's epochs reserved for testing.
+
+    Returns
+    -------
+    dict[int, dict]
+        Keys are client IDs. Each value contains:
+
+        - ``"train"`` : :class:`SleepDataset` for local training / personalization.
+        - ``"test"`` : :class:`SleepDataset` for client-level evaluation.
+        - ``"num_train"`` : int, training set size (used in FedAvg weighting).
+        - ``"num_test"`` : int, test set size.
+    """
+    clients = {}
+
+    for cid in np.unique(client_ids):
+        idx = np.where(client_ids == cid)[0]
+
+        train_idx, test_idx = train_test_split(
+            idx,
+            test_size=test_size,
+            random_state=seed,
+            stratify=y[idx],
+        )
+
+        clients[int(cid)] = {
+            "train": SleepDataset(X[train_idx], y[train_idx]),
+            "test": SleepDataset(X[test_idx], y[test_idx]),
+            "num_train": len(train_idx),
+            "num_test": len(test_idx),
+        }
+
+    return clients
+
+
+def centralized_split(X, y, seed: int, test_size: float = 0.2):
+    """
+    Stratified global train/test index split for the centralized upper bound.
+
+    Unlike :func:`split_clients`, this pools all clients and performs one
+    stratified split — appropriate when data are not federated.
+
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Unused except for implicit length via ``y``; kept for API symmetry.
+    y : numpy.ndarray
+        Labels used for stratification.
+    seed : int
+        Random seed for reproducibility.
+    test_size : float, default=0.2
+        Hold-out fraction.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        ``train_idx``, ``test_idx`` — integer index arrays into ``X`` and ``y``.
+    """
+    train_idx, test_idx = train_test_split(
+        np.arange(len(y)),
+        test_size=test_size,
+        random_state=seed,
+        stratify=y,
+    )
+    return train_idx, test_idx
+
+
 # =============================================================================
-# Base CNN-BiLSTM  (used by Centralized, FedAvg, Personalized FL)
+# Models
 # =============================================================================
+
 class CNNBiLSTM(nn.Module):
     """
-    Convolutional + bidirectional LSTM classifier for single-channel EEG epochs.
+    One-dimensional CNN + bidirectional LSTM classifier for sleep staging.
 
-    Architecture:
-        Conv1d stack (32 → 64 → 128 channels, max-pool) → BiLSTM (hidden 64) →
-        last time-step features (128-d) → MLP classifier.
+    Architecture: three Conv1d blocks with batch norm, ReLU, and max-pooling
+    reduce the temporal dimension; a BiLSTM reads the sequence; the last time-step
+    hidden state is classified into five sleep stages (W, N1, N2, N3, REM).
 
-    Used as the backbone for centralized training, FedAvg, personalized FL,
-    and as the feature extractor inside :class:`DomainAdaptiveCNNBiLSTM`.
+    Parameters
+    ----------
+    num_classes : int, default=5
+        Number of output sleep-stage classes.
 
-    @param num_classes: Number of sleep stages (default 5: W, N1, N2, N3, REM).
+    Attributes
+    ----------
+    cnn : nn.Sequential
+        Temporal convolution stack (1 → 32 → 64 → 128 channels).
+    lstm : nn.LSTM
+        Bidirectional LSTM with hidden size 64 (output dim 128).
+    classifier : nn.Sequential
+        MLP head mapping 128-d features to ``num_classes`` logits.
+
+    See Also
+    --------
+    DomainAdaptiveCNNBiLSTM : Adds GRL and domain head on the same backbone.
     """
 
     def __init__(self, num_classes: int = 5):
-        """
-        @param num_classes: Output dimension of the classification head.
-        """
         super().__init__()
 
         self.cnn = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
-            nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
 
             nn.Conv1d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
 
             nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128), nn.ReLU(), nn.MaxPool1d(2),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
         )
 
         self.lstm = nn.LSTM(
-            input_size=128, hidden_size=64,
-            num_layers=1, batch_first=True, bidirectional=True,
+            input_size=128,
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(64, num_classes),
         )
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_features(self, x):
         """
-        Run CNN + BiLSTM and return the final hidden state (shared embedding).
+        Run the shared encoder without the classification head.
 
-        @param x: Input batch ``(B, 1, T)`` — one EEG channel per epoch.
-        @return: Feature tensor ``(B, 128)`` (concatenated BiLSTM directions).
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input of shape ``(batch, 1, time_steps)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Feature vector of shape ``(batch, 128)`` (last BiLSTM state).
         """
         x = self.cnn(x)
         x = x.permute(0, 2, 1)
         out, _ = self.lstm(x)
         return out[:, -1, :]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        Full forward pass: features → linear classifier.
+        Forward pass returning sleep-stage logits only.
 
-        @param x: Input batch ``(B, 1, T)``.
-        @return: Class logits ``(B, num_classes)``.
+        Parameters
+        ----------
+        x : torch.Tensor
+            Batch of EEG epochs.
+
+        Returns
+        -------
+        torch.Tensor
+            Class logits of shape ``(batch, num_classes)``.
         """
-        return self.classifier(self.extract_features(x))
+        h = self.extract_features(x)
+        return self.classifier(h)
 
 
-# =============================================================================
-# Domain-Adaptive CNN-BiLSTM  — with proper Gradient Reversal Layer
-# =============================================================================
 class DomainAdaptiveCNNBiLSTM(nn.Module):
     """
-    Domain-adaptive CNN-BiLSTM with dual heads and Gradient Reversal Layer.
+    Domain-adaptive variant of :class:`CNNBiLSTM` for DA-PFL Phase 1.
 
-    Architecture (matches Section III-B of the paper):
+    Shares the same CNN-BiLSTM backbone but adds a domain classifier on
+    GRL-transformed features. The domain head predicts which of ``num_domains``
+    clients produced the epoch; adversarial training aligns representations
+    across clients while the class head learns sleep staging.
 
-        EEG epoch → CNN → BiLSTM → h (128-d shared feature)
-                                    │
-                         ┌──────────┴──────────────┐
-                         │                         │
-                  Classifier head          GRL(λ) → Domain head
-                  (sleep stage)            (client identity)
+    Parameters
+    ----------
+    num_classes : int, default=5
+        Sleep-stage classes.
+    num_domains : int, default=20
+        Number of federated clients (10 subjects × 2 nights).
+    lam : float, default=0.1
+        GRL strength passed to :class:`GradientReversalLayer`.
 
-    The GRL reverses gradients flowing back from the domain head into ``h``,
-    so the shared feature extractor is simultaneously optimised to:
-
-        - **Minimise** ``L_cls`` (correct stage prediction)
-        - **Maximise** ``L_dom`` (confuse the domain discriminator)
-
-    Effective feature loss (eq. 3):
-
-        ``L_{f_θ} = L_cls(g_φ(h), y) − λ · L_dom(d_ψ(h), k)``
-
-    Implemented in one forward/backward pass via :class:`GradientReversalLayer`.
-
-    @param num_classes: Sleep stage classes (default 5).
-    @param num_domains: Number of federated clients / domain labels.
-    @param lam: GRL reversal scale λ (default ``DOMAIN_LAMBDA``).
-    @see train_local_da_model
+    Attributes
+    ----------
+    backbone : CNNBiLSTM
+        Shared feature extractor and class head.
+    grl : GradientReversalLayer
+        Gradient reversal between backbone and domain head.
+    domain_classifier : nn.Sequential
+        MLP predicting client/domain ID.
     """
 
-    def __init__(self, num_classes: int = 5, num_domains: int = 20,
-                 lam: float = DOMAIN_LAMBDA):
-        """
-        @param num_classes: Output size of the sleep-stage classifier.
-        @param num_domains: Output size of the domain (client-id) classifier.
-        @param lam: Adversarial strength passed to :class:`GradientReversalLayer`.
-        """
+    def __init__(self, num_classes: int = 5, num_domains: int = 20, lam: float = 0.1):
         super().__init__()
 
         self.backbone = CNNBiLSTM(num_classes=num_classes)
-
-        # GRL sits between the shared feature and the domain head
         self.grl = GradientReversalLayer(lam=lam)
 
-        # Domain discriminator  h → GRL(h) → d_ψ  (predicts client id)
         self.domain_classifier = nn.Sequential(
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(64, num_domains),
         )
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         """
-        Dual-head forward: classification on ``h``, domain prediction on ``GRL(h)``.
+        Compute sleep-stage and domain logits.
 
-        @param x: EEG batch ``(B, 1, T)``.
-        @return: Tuple ``(class_logits, domain_logits)`` where
-                 - ``class_logits``: ``(B, num_classes)`` sleep stage scores.
-                 - ``domain_logits``: ``(B, num_domains)`` client-id scores
-                   (gradients into ``h`` are reversed via GRL).
+        Parameters
+        ----------
+        x : torch.Tensor
+            Batch of EEG epochs.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            ``class_logits`` : shape ``(batch, num_classes)``.
+            ``domain_logits`` : shape ``(batch, num_domains)``.
         """
         h = self.backbone.extract_features(x)
-        class_logits  = self.backbone.classifier(h)
+        class_logits = self.backbone.classifier(h)
         domain_logits = self.domain_classifier(self.grl(h))
         return class_logits, domain_logits
 
 
 # =============================================================================
-# Training / Evaluation Helpers
+# Evaluation helpers
 # =============================================================================
-def train_one_epoch(model, loader, optimizer, criterion):
+
+def evaluate_classifier(model, loader):
     """
-    Train a standard (non-domain-adaptive) model for one epoch.
+    Evaluate a :class:`CNNBiLSTM` (or compatible) model on a held-out loader.
 
-    @param model: ``nn.Module`` with single-output ``forward`` (e.g. :class:`CNNBiLSTM`).
-    @param loader: ``DataLoader`` yielding ``(X, y)`` batches.
-    @param optimizer: PyTorch optimizer (e.g. Adam).
-    @param criterion: Loss function (typically ``CrossEntropyLoss``).
-    @return: Mean training loss over all batches in the epoch.
-    """
-    model.train()
-    total_loss = 0.0
-    for X, y in tqdm(loader, desc="Training", leave=False):
-        X, y = X.to(DEVICE), y.to(DEVICE)
-        optimizer.zero_grad()
-        loss = criterion(model(X), y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(loader)
+    Parameters
+    ----------
+    model : nn.Module
+        Classifier returning a single logits tensor per batch.
+    loader : DataLoader
+        Batched test data.
 
-
-def evaluate(model, loader):
-    """
-    Evaluate a single-output classifier on a held-out loader.
-
-    @param model: Classifier producing logits ``(B, num_classes)``.
-    @param loader: Test ``DataLoader`` with ``(X, y)`` batches.
-    @return: Tuple ``(accuracy, macro_f1, kappa, y_true, y_pred)`` where the
-             last two are Python lists of integer labels for reporting.
+    Returns
+    -------
+    tuple[float, float, float, list, list]
+        ``accuracy``, ``macro_f1``, ``cohen_kappa``, ``y_true``, ``y_pred``.
     """
     model.eval()
     y_true, y_pred = [], []
+
     with torch.no_grad():
-        for X, y in loader:
-            preds = torch.argmax(model(X.to(DEVICE)), dim=1).cpu().numpy()
-            y_true.extend(y.numpy())
+        for X_b, y_b in loader:
+            X_b = X_b.to(DEVICE)
+            logits = model(X_b)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            y_true.extend(y_b.numpy())
             y_pred.extend(preds)
-    return (
-        accuracy_score(y_true, y_pred),
-        f1_score(y_true, y_pred, average="macro"),
-        cohen_kappa_score(y_true, y_pred),
-        y_true, y_pred,
-    )
+
+    return metrics_from_predictions(y_true, y_pred)
 
 
 def evaluate_domain_model(model, loader):
     """
-    Evaluate :class:`DomainAdaptiveCNNBiLSTM` using only the classification head.
+    Evaluate :class:`DomainAdaptiveCNNBiLSTM` using classification logits only.
 
-    Domain logits are computed but discarded; metrics reflect sleep-stage accuracy.
+    Domain logits are ignored at test time (sleep-stage prediction only).
 
-    @param model: :class:`DomainAdaptiveCNNBiLSTM` instance.
-    @param loader: Test ``DataLoader`` with ``(X, y)`` batches.
-    @return: Tuple ``(accuracy, macro_f1, kappa, y_true, y_pred)``.
+    Parameters
+    ----------
+    model : DomainAdaptiveCNNBiLSTM
+        Model returning ``(class_logits, domain_logits)``.
+    loader : DataLoader
+        Batched test data.
+
+    Returns
+    -------
+    tuple[float, float, float, list, list]
+        Same tuple as :func:`evaluate_classifier`.
     """
     model.eval()
     y_true, y_pred = [], []
+
     with torch.no_grad():
-        for X, y in loader:
-            class_logits, _ = model(X.to(DEVICE))
+        for X_b, y_b in loader:
+            X_b = X_b.to(DEVICE)
+            class_logits, _ = model(X_b)
             preds = torch.argmax(class_logits, dim=1).cpu().numpy()
-            y_true.extend(y.numpy())
+            y_true.extend(y_b.numpy())
             y_pred.extend(preds)
-    return (
-        accuracy_score(y_true, y_pred),
-        f1_score(y_true, y_pred, average="macro"),
-        cohen_kappa_score(y_true, y_pred),
-        y_true, y_pred,
+
+    return metrics_from_predictions(y_true, y_pred)
+
+
+def metrics_from_predictions(y_true, y_pred):
+    """
+    Compute standard sleep-staging metrics from label lists.
+
+    Parameters
+    ----------
+    y_true : sequence
+        Ground-truth integer labels.
+    y_pred : sequence
+        Predicted integer labels.
+
+    Returns
+    -------
+    tuple[float, float, float, list, list]
+        Accuracy, macro-averaged F1 (zero_division=0), Cohen's kappa,
+        and copies of ``y_true`` / ``y_pred`` as Python lists.
+    """
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    return acc, f1, kappa, list(y_true), list(y_pred)
+
+
+def aggregate_global_eval(model, clients, domain_model: bool = False):
+    """
+    Evaluate one global model by concatenating all clients' test predictions.
+
+    Used for FedAvg and DA-PFL Phase 1 global checkpoints (same weights on
+    every client, predictions pooled for macro metrics).
+
+    Parameters
+    ----------
+    model : nn.Module
+        Global model (classifier or domain-adaptive).
+    clients : dict
+        Per-client data dicts from :func:`split_clients`.
+    domain_model : bool, default=False
+        If True, use :func:`evaluate_domain_model`; else :func:`evaluate_classifier`.
+
+    Returns
+    -------
+    tuple[float, float, float, list, list]
+        Pooled accuracy, macro F1, kappa, ``y_true``, ``y_pred``.
+    """
+    all_true, all_pred = [], []
+
+    for data in clients.values():
+        loader = DataLoader(data["test"], batch_size=BATCH_SIZE, shuffle=False)
+        if domain_model:
+            _, _, _, yt, yp = evaluate_domain_model(model, loader)
+        else:
+            _, _, _, yt, yp = evaluate_classifier(model, loader)
+        all_true.extend(yt)
+        all_pred.extend(yp)
+
+    acc, f1, kappa, _, _ = metrics_from_predictions(all_true, all_pred)
+    return acc, f1, kappa, all_true, all_pred
+
+
+def evaluate_personalized(models, clients, domain_model: bool = False):
+    """
+    Evaluate client-specific models on each client's test set.
+
+    Parameters
+    ----------
+    models : dict[int, nn.Module]
+        Mapping from client ID to personalized model.
+    clients : dict
+        Per-client train/test datasets.
+    domain_model : bool, default=False
+        Whether models return ``(class_logits, domain_logits)``.
+
+    Returns
+    -------
+    tuple[float, float, float, list, list]
+        Pooled metrics over all clients' test epochs.
+    """
+    all_true, all_pred = [], []
+
+    for cid, model in models.items():
+        loader = DataLoader(clients[cid]["test"], batch_size=BATCH_SIZE, shuffle=False)
+
+        if domain_model:
+            _, _, _, yt, yp = evaluate_domain_model(model, loader)
+        else:
+            _, _, _, yt, yp = evaluate_classifier(model, loader)
+
+        all_true.extend(yt)
+        all_pred.extend(yp)
+
+    acc, f1, kappa, _, _ = metrics_from_predictions(all_true, all_pred)
+    return acc, f1, kappa, all_true, all_pred
+
+
+def save_classification_report(y_true, y_pred, out_path: Path):
+    """
+    Write per-class precision/recall/F1 to text and CSV files.
+
+    Parameters
+    ----------
+    y_true : sequence
+        Ground-truth labels.
+    y_pred : sequence
+        Predicted labels.
+    out_path : Path
+        Base path for ``.txt`` report; CSV saved as same stem with ``.csv``.
+
+    Returns
+    -------
+    None
+
+    Side Effects
+    ------------
+    Creates ``out_path`` (text) and ``out_path.with_suffix('.csv')``.
+    """
+    target_names = [ID_2_LABEL[i] for i in range(5)]
+    text_report = classification_report(
+        y_true,
+        y_pred,
+        target_names=target_names,
+        zero_division=0,
+    )
+    dict_report = classification_report(
+        y_true,
+        y_pred,
+        target_names=target_names,
+        zero_division=0,
+        output_dict=True,
     )
 
+    out_path.write_text(text_report)
+    pd.DataFrame(dict_report).transpose().to_csv(out_path.with_suffix(".csv"))
+
 
 # =============================================================================
-# Client Split
+# Training helpers
 # =============================================================================
-def split_clients(X, y, client_ids, test_size=0.2):
+
+def train_one_epoch_classifier(model, loader, optimizer, criterion, desc="Training"):
     """
-    Partition pooled data into per-client train/test :class:`SleepDataset` splits.
+    Train a standard classifier for one epoch over ``loader``.
 
-    Each unique value in ``client_ids`` becomes one federated client. Stratified
-    ``train_test_split`` preserves label distribution within each client.
+    Parameters
+    ----------
+    model : nn.Module
+        Model producing class logits.
+    loader : DataLoader
+        Training batches.
+    optimizer : torch.optim.Optimizer
+        Optimizer for all ``model`` parameters.
+    criterion : nn.Module
+        Loss function (typically ``CrossEntropyLoss``).
+    desc : str, default="Training"
+        Progress bar description for ``tqdm``.
 
-    @param X: Full feature array ``(N, 1, T)``.
-    @param y: Full label array ``(N,)``.
-    @param client_ids: Client index per sample ``(N,)``.
-    @param test_size: Fraction of each client's epochs reserved for testing.
-    @return: Dict mapping ``client_id → {"train", "test", "num_train"}``.
+    Returns
+    -------
+    float
+        Mean training loss over batches (0 if loader is empty).
     """
-    clients = {}
-    for cid in np.unique(client_ids):
-        idx = np.where(client_ids == cid)[0]
-        train_idx, test_idx = train_test_split(
-            idx, test_size=test_size, random_state=42, stratify=y[idx]
-        )
-        clients[int(cid)] = {
-            "train": SleepDataset(X[train_idx], y[train_idx]),
-            "test":  SleepDataset(X[test_idx],  y[test_idx]),
-            "num_train": len(train_idx),
-        }
-    return clients
+    model.train()
+    total_loss = 0.0
+
+    for X_b, y_b in tqdm(loader, desc=desc, leave=False):
+        X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
+
+        optimizer.zero_grad()
+        logits = model(X_b)
+        loss = criterion(logits, y_b)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / max(1, len(loader))
 
 
-# =============================================================================
-# FedAvg Aggregation
-# =============================================================================
 def fedavg(state_dicts, client_sizes):
     """
-    Federated averaging (FedAvg) over client model weights.
+    Federated averaging (FedAvg) of client model state dictionaries.
 
-    Each parameter is a sample-size-weighted mean across clients:
+    Each parameter tensor is weighted by the client's training set size so
+    clients with more epochs contribute proportionally more to the global model.
 
-        ``θ_global = Σ_i (n_i / N) · θ_i``
+    Parameters
+    ----------
+    state_dicts : list[dict]
+        One ``state_dict`` per participating client after local training.
+    client_sizes : list[int]
+        ``num_train`` per client, aligned with ``state_dicts``.
 
-    @param state_dicts: List of per-client ``state_dict`` mappings.
-    @param client_sizes: List of training sample counts ``n_i`` per client.
-    @return: Aggregated ``state_dict`` with the same keys as client dicts.
+    Returns
+    -------
+    dict
+        Weighted-average ``state_dict`` suitable for ``load_state_dict``.
     """
     avg_state = copy.deepcopy(state_dicts[0])
-    total = sum(client_sizes)
+    total = float(sum(client_sizes))
+
     for key in avg_state:
         avg_state[key] = sum(
             state_dicts[i][key] * (client_sizes[i] / total)
             for i in range(len(state_dicts))
         )
+
     return avg_state
 
 
-def train_local_model(global_model, train_loader, epochs=1):
+# =============================================================================
+# Centralized baseline
+# =============================================================================
+
+def run_centralized(X, y, seed: int, out_dir: Path, verbose: bool = False):
     """
-    One round of local FedAvg client training (classification only).
+    Train and evaluate the centralized CNN-BiLSTM upper bound.
 
-    Copies the global model, runs ``epochs`` of SGD on the client's private
-    data, and returns updated weights without modifying the global model in-place.
+    Pools all data, performs a stratified 80/20 split, trains for
+    ``CENTRAL_EPOCHS`` with Adam at ``LR``, and saves weights plus
+    classification reports under ``out_dir/seed_{seed}/``.
 
-    @param global_model: Server/global :class:`CNNBiLSTM` (or compatible module).
-    @param train_loader: Client training ``DataLoader``.
-    @param epochs: Number of local passes over the client data (default 1).
-    @return: ``state_dict`` of the locally trained model.
+    Parameters
+    ----------
+    X : numpy.ndarray
+        Full feature matrix.
+    y : numpy.ndarray
+        Full label vector.
+    seed : int
+        RNG seed for split and training.
+    out_dir : Path
+        Root output directory for checkpoints and reports.
+    verbose : bool, default=False
+        If True, print per-epoch validation metrics.
+
+    Returns
+    -------
+    dict
+        Result row with keys ``method``, ``seed``, ``accuracy``,
+        ``macro_f1``, ``kappa``.
     """
-    local = copy.deepcopy(global_model).to(DEVICE)
-    opt   = torch.optim.Adam(local.parameters(), lr=LR)
-    crit  = nn.CrossEntropyLoss()
-    for _ in range(epochs):
-        train_one_epoch(local, train_loader, opt, crit)
-    return local.state_dict()
+    set_seed(seed)
 
+    train_idx, test_idx = centralized_split(X, y, seed=seed)
 
-def evaluate_global_model(model, clients):
-    """
-    Pool predictions from all clients' test sets for one global FedAvg model.
-
-    @param model: Global :class:`CNNBiLSTM` after aggregation.
-    @param clients: Client dict from :func:`split_clients`.
-    @return: Tuple ``(accuracy, macro_f1, kappa)`` over concatenated test epochs.
-    """
-    all_true, all_pred = [], []
-    for data in clients.values():
-        loader = DataLoader(data["test"], batch_size=BATCH_SIZE, shuffle=False)
-        _, _, _, yt, yp = evaluate(model, loader)
-        all_true.extend(yt); all_pred.extend(yp)
-    return (
-        accuracy_score(all_true, all_pred),
-        f1_score(all_true, all_pred, average="macro"),
-        cohen_kappa_score(all_true, all_pred),
+    train_loader = DataLoader(
+        SleepDataset(X[train_idx], y[train_idx]),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+    )
+    test_loader = DataLoader(
+        SleepDataset(X[test_idx], y[test_idx]),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
     )
 
+    model = CNNBiLSTM(num_classes=5).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
 
-def run_fedavg(clients):
+    for epoch in range(CENTRAL_EPOCHS):
+        loss = train_one_epoch_classifier(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            desc=f"Central seed={seed} ep={epoch+1}",
+        )
+        if verbose:
+            acc, f1, kappa, _, _ = evaluate_classifier(model, test_loader)
+            print(
+                f"Centralized | seed={seed} | epoch={epoch+1}/{CENTRAL_EPOCHS} "
+                f"| loss={loss:.4f} | acc={acc:.4f} | f1={f1:.4f} | kappa={kappa:.4f}"
+            )
+
+    acc, f1, kappa, y_true, y_pred = evaluate_classifier(model, test_loader)
+
+    seed_dir = out_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), seed_dir / "centralized.pt")
+    save_classification_report(y_true, y_pred, seed_dir / "centralized_report.txt")
+
+    return {
+        "method": "Centralized CNN-BiLSTM",
+        "seed": seed,
+        "accuracy": acc,
+        "macro_f1": f1,
+        "kappa": kappa,
+    }
+
+
+# =============================================================================
+# FedAvg
+# =============================================================================
+
+def train_local_fedavg(global_model, train_loader):
     """
-    Run full FedAvg training for ``FED_ROUNDS`` communication rounds.
+    One round of local FedAvg training on a single client.
 
-    Each round: every client trains locally on its private data, uploads
-    weights, server aggregates via :func:`fedavg`, then evaluates globally.
+    Copies the global model, runs ``LOCAL_EPOCHS`` of SGD-style updates
+    on the client's training loader, and returns updated weights.
 
-    @param clients: Per-client train/test data from :func:`split_clients`.
-    @return: Trained global :class:`CNNBiLSTM` after the final aggregation round.
+    Parameters
+    ----------
+    global_model : CNNBiLSTM
+        Current global model (copied, not modified in place).
+    train_loader : DataLoader
+        Client training data.
+
+    Returns
+    -------
+    dict
+        Local ``state_dict`` after on-device training.
     """
+    local_model = copy.deepcopy(global_model).to(DEVICE)
+    optimizer = torch.optim.Adam(local_model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+
+    for _ in range(LOCAL_EPOCHS):
+        train_one_epoch_classifier(
+            local_model,
+            train_loader,
+            optimizer,
+            criterion,
+            desc="Local FedAvg",
+        )
+
+    return local_model.state_dict()
+
+
+def run_fedavg(clients, seed: int, out_dir: Path, verbose: bool = False):
+    """
+    Run full FedAvg federated training across all clients.
+
+    For each of ``FED_ROUNDS`` rounds: every client trains locally, weights
+    are aggregated with :func:`fedavg`, and global test metrics are recorded.
+    Final global model and reports are saved under ``out_dir/seed_{seed}/``.
+
+    Parameters
+    ----------
+    clients : dict
+        Per-client datasets from :func:`split_clients`.
+    seed : int
+        Experiment seed.
+    out_dir : Path
+        Output root.
+    verbose : bool, default=False
+        Print round-level metrics when True.
+
+    Returns
+    -------
+    tuple[nn.Module, dict, list[dict]]
+        Final ``global_model``, final result dict, and per-round convergence rows.
+    """
+    set_seed(seed)
+
     global_model = CNNBiLSTM(num_classes=5).to(DEVICE)
-    print("\n========== FedAvg Training ==========")
+    convergence = []
+
     for rnd in range(FED_ROUNDS):
-        states, sizes = [], []
+        local_states, client_sizes = [], []
+
         for data in clients.values():
             loader = DataLoader(data["train"], batch_size=BATCH_SIZE, shuffle=True)
-            states.append(train_local_model(global_model, loader, LOCAL_EPOCHS))
-            sizes.append(data["num_train"])
-        global_model.load_state_dict(fedavg(states, sizes))
-        acc, f1, kappa = evaluate_global_model(global_model, clients)
-        print(f"FedAvg Round {rnd+1}/{FED_ROUNDS} | "
-              f"Acc: {acc:.4f} | Macro-F1: {f1:.4f} | Kappa: {kappa:.4f}")
-    return global_model
+            local_states.append(train_local_fedavg(global_model, loader))
+            client_sizes.append(data["num_train"])
+
+        global_model.load_state_dict(fedavg(local_states, client_sizes))
+
+        acc, f1, kappa, _, _ = aggregate_global_eval(
+            global_model,
+            clients,
+            domain_model=False,
+        )
+
+        convergence.append({
+            "method": "FedAvg",
+            "seed": seed,
+            "round": rnd + 1,
+            "accuracy": acc,
+            "macro_f1": f1,
+            "kappa": kappa,
+        })
+
+        if verbose:
+            print(
+                f"FedAvg | seed={seed} | round={rnd+1}/{FED_ROUNDS} "
+                f"| acc={acc:.4f} | f1={f1:.4f} | kappa={kappa:.4f}"
+            )
+
+    acc, f1, kappa, y_true, y_pred = aggregate_global_eval(
+        global_model,
+        clients,
+        domain_model=False,
+    )
+
+    seed_dir = out_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(global_model.state_dict(), seed_dir / "fedavg.pt")
+    save_classification_report(y_true, y_pred, seed_dir / "fedavg_report.txt")
+
+    return global_model, {
+        "method": "FedAvg",
+        "seed": seed,
+        "accuracy": acc,
+        "macro_f1": f1,
+        "kappa": kappa,
+    }, convergence
 
 
 # =============================================================================
-# Personalized FL  (FedAvg global + client fine-tune)
+# Personalized FL
 # =============================================================================
-def personalize_clients(global_model, clients, fine_tune_epochs=3):
+
+def personalize_fedavg(global_model, clients):
     """
-    Personalized FL: fine-tune a copy of the global model per client.
+    Personalized FL: fine-tune the FedAvg global model per client.
 
-    Uses a reduced learning rate (``LR * 0.1``) and client-local training data
-    only. No domain-adaptation loss is applied.
+    Each client receives a deep copy of ``global_model`` and trains for
+    ``PERSONAL_EPOCHS`` with learning rate ``LR * PERSONAL_LR_FACTOR`` using
+    classification loss only (no domain adaptation).
 
-    @param global_model: FedAvg-global :class:`CNNBiLSTM`.
-    @param clients: Client dict from :func:`split_clients`.
-    @param fine_tune_epochs: Local fine-tuning epochs per client (default 3).
-    @return: Dict ``client_id → personalized nn.Module``.
+    Parameters
+    ----------
+    global_model : CNNBiLSTM
+        Converged FedAvg global weights.
+    clients : dict
+        Per-client train/test splits.
+
+    Returns
+    -------
+    dict[int, nn.Module]
+        Client ID → fine-tuned model on ``DEVICE``.
     """
     personalized = {}
+
     for cid, data in clients.items():
         model = copy.deepcopy(global_model).to(DEVICE)
         loader = DataLoader(data["train"], batch_size=BATCH_SIZE, shuffle=True)
-        opt  = torch.optim.Adam(model.parameters(), lr=LR * 0.1)
-        crit = nn.CrossEntropyLoss()
-        for _ in range(fine_tune_epochs):
-            train_one_epoch(model, loader, opt, crit)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR * PERSONAL_LR_FACTOR)
+        criterion = nn.CrossEntropyLoss()
+
+        for ep in range(PERSONAL_EPOCHS):
+            train_one_epoch_classifier(
+                model,
+                loader,
+                optimizer,
+                criterion,
+                desc=f"PersFL cid={cid} ep={ep+1}",
+            )
+
         personalized[cid] = model
+
     return personalized
 
 
-def evaluate_personalized_models(models, clients):
+def run_personalized_fl(fedavg_model, clients, seed: int, out_dir: Path):
     """
-    Evaluate per-client personalized models on each client's test split.
+    Execute Personalized FL baseline and persist per-client checkpoints.
 
-    @param models: Dict from :func:`personalize_clients`.
-    @param clients: Client dict from :func:`split_clients`.
-    @return: Tuple ``(accuracy, macro_f1, kappa)`` pooled over all clients.
+    Parameters
+    ----------
+    fedavg_model : CNNBiLSTM
+        Global model from :func:`run_fedavg`.
+    clients : dict
+        Client data partitions.
+    seed : int
+        Seed for output paths and logging.
+    out_dir : Path
+        Directory for ``pers_fl_client_{cid}.pt`` and reports.
+
+    Returns
+    -------
+    dict
+        Final pooled metrics with ``method`` = ``"Pers. FL (no DA)"``.
     """
-    all_true, all_pred = [], []
-    for cid, model in models.items():
-        loader = DataLoader(clients[cid]["test"], batch_size=BATCH_SIZE, shuffle=False)
-        _, _, _, yt, yp = evaluate(model, loader)
-        all_true.extend(yt); all_pred.extend(yp)
-    return (
-        accuracy_score(all_true, all_pred),
-        f1_score(all_true, all_pred, average="macro"),
-        cohen_kappa_score(all_true, all_pred),
+    models = personalize_fedavg(fedavg_model, clients)
+    acc, f1, kappa, y_true, y_pred = evaluate_personalized(
+        models,
+        clients,
+        domain_model=False,
     )
 
+    seed_dir = out_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+
+    for cid, model in models.items():
+        torch.save(model.state_dict(), seed_dir / f"pers_fl_client_{cid}.pt")
+
+    save_classification_report(y_true, y_pred, seed_dir / "pers_fl_report.txt")
+
+    return {
+        "method": "Pers. FL (no DA)",
+        "seed": seed,
+        "accuracy": acc,
+        "macro_f1": f1,
+        "kappa": kappa,
+    }
+
 
 # =============================================================================
-# DA-PFL  — Domain-Adaptive Federated Learning with Gradient Reversal Layer
+# DA-PFL
 # =============================================================================
-def train_local_da_model(global_model, train_loader, client_id, epochs=1):
+
+def train_local_da(global_model, train_loader, client_id: int):
     """
-    Local DA-PFL training round with joint classification + domain losses.
+    Phase 1 DA-PFL local training with joint classification and domain loss.
 
-    Combined loss (scalar sum for one backward pass):
+    Loss per batch: ``L_cls + L_dom`` where ``L_cls`` is cross-entropy on sleep
+    stages and ``L_dom`` is cross-entropy on the client ID (domain label).
+    Domain loss backpropagates through the GRL, so the backbone receives an
+    adversarial gradient that encourages domain-invariant features.
 
-        ``L = L_cls(g_φ(h), y) + L_dom(d_ψ(GRL_λ(h)), k)``
+    Parameters
+    ----------
+    global_model : DomainAdaptiveCNNBiLSTM
+        Current global domain-adaptive model (deep-copied locally).
+    train_loader : DataLoader
+        Client training epochs.
+    client_id : int
+        Federated client index used as the domain label for all batches.
 
-    GRL negates gradients into ``h``, so the effective feature update is:
-
-        ``∂L/∂θ = ∂L_cls/∂θ − λ · ∂L_dom/∂θ``
-
-    The backbone minimises stage loss and maximises domain confusion; the
-    domain head still minimises ``L_dom`` with normal gradients.
-
-    @param global_model: Global :class:`DomainAdaptiveCNNBiLSTM`.
-    @param train_loader: Client training ``DataLoader``.
-    @param client_id: Integer client/domain label ``k`` for all batches in this round.
-    @param epochs: Local training epochs (default 1).
-    @return: ``state_dict`` after local adversarial + classification training.
-    @see DomainAdaptiveCNNBiLSTM
+    Returns
+    -------
+    dict
+        Updated local ``state_dict`` after ``LOCAL_EPOCHS``.
     """
-    local = copy.deepcopy(global_model).to(DEVICE)
-    opt   = torch.optim.Adam(local.parameters(), lr=LR)
+    local_model = copy.deepcopy(global_model).to(DEVICE)
 
+    optimizer = torch.optim.Adam(local_model.parameters(), lr=LR)
     cls_loss_fn = nn.CrossEntropyLoss()
     dom_loss_fn = nn.CrossEntropyLoss()
 
-    for _ in range(epochs):
-        local.train()
-        for X_b, y_b in tqdm(train_loader, desc=f"DA-Local cid={client_id}", leave=False):
-            X_b = X_b.to(DEVICE)
-            y_b = y_b.to(DEVICE)
+    for _ in range(LOCAL_EPOCHS):
+        local_model.train()
+
+        for X_b, y_b in tqdm(train_loader, desc=f"DA local cid={client_id}", leave=False):
+            X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
             domain_labels = torch.full(
-                (X_b.size(0),), int(client_id),
-                dtype=torch.long, device=DEVICE,
+                (X_b.size(0),),
+                int(client_id),
+                dtype=torch.long,
+                device=DEVICE,
             )
 
-            opt.zero_grad()
+            optimizer.zero_grad()
 
-            # Forward: class_logits uses h directly;
-            #          domain_logits uses GRL(h) — see DomainAdaptiveCNNBiLSTM.forward()
-            class_logits, domain_logits = local(X_b)
-
-            # L_cls  →  normal minimisation for classifier + feature extractor
-            # L_dom  →  normal minimisation for domain head;
-            #           gradient REVERSAL via GRL causes feature extractor
-            #           to MAXIMISE this term (domain confusion)
+            class_logits, domain_logits = local_model(X_b)
             loss = cls_loss_fn(class_logits, y_b) + dom_loss_fn(domain_logits, domain_labels)
 
-            loss.backward()   # GRL handles sign reversal automatically
-            opt.step()
+            loss.backward()
+            optimizer.step()
 
-    return local.state_dict()
+    return local_model.state_dict()
 
 
-def evaluate_da_global_model(model, clients):
+def run_da_pfl_phase1(clients, seed: int, num_domains: int, out_dir: Path, verbose: bool = False):
     """
-    Evaluate a global DA-PFL model across all clients' test sets.
+    DA-PFL Phase 1: federated domain-adaptive training with GRL.
 
-    @param model: Global :class:`DomainAdaptiveCNNBiLSTM`.
-    @param clients: Client dict from :func:`split_clients`.
-    @return: Tuple ``(accuracy, macro_f1, kappa)`` using classification head only.
+    Mirrors :func:`run_fedavg` but uses :class:`DomainAdaptiveCNNBiLSTM` and
+    :func:`train_local_da`. Saves the pre-personalization global checkpoint as
+    ``da_pfl_phase1_grl.pt``.
+
+    Parameters
+    ----------
+    clients : dict
+        Per-client data.
+    seed : int
+        Experiment seed.
+    num_domains : int
+        Number of clients (domain classes), typically 20.
+    out_dir : Path
+        Output directory.
+    verbose : bool, default=False
+        Print round metrics when True.
+
+    Returns
+    -------
+    tuple[DomainAdaptiveCNNBiLSTM, list[dict]]
+        Global model after Phase 1 and convergence curve rows.
     """
-    all_true, all_pred = [], []
-    for data in clients.values():
-        loader = DataLoader(data["test"], batch_size=BATCH_SIZE, shuffle=False)
-        _, _, _, yt, yp = evaluate_domain_model(model, loader)
-        all_true.extend(yt); all_pred.extend(yp)
-    return (
-        accuracy_score(all_true, all_pred),
-        f1_score(all_true, all_pred, average="macro"),
-        cohen_kappa_score(all_true, all_pred),
-    )
+    set_seed(seed)
 
-
-def run_da_pfl(clients, num_domains):
-    """
-    Run domain-adaptive federated learning (DA-PFL) for ``FED_ROUNDS`` rounds.
-
-    Same communication pattern as :func:`run_fedavg`, but local updates use
-    :func:`train_local_da_model` with GRL-based domain adaptation.
-
-    @param clients: Per-client data from :func:`split_clients`.
-    @param num_domains: Number of clients (domain classifier output size).
-    @return: Trained global :class:`DomainAdaptiveCNNBiLSTM`.
-    """
     global_model = DomainAdaptiveCNNBiLSTM(
-        num_classes=5, num_domains=num_domains, lam=DOMAIN_LAMBDA
+        num_classes=5,
+        num_domains=num_domains,
+        lam=DOMAIN_LAMBDA,
     ).to(DEVICE)
 
-    print("\n========== DA-PFL: Federated Training ==========")
+    convergence = []
+
     for rnd in range(FED_ROUNDS):
-        states, sizes = [], []
+        local_states, client_sizes = [], []
+
         for cid, data in clients.items():
             loader = DataLoader(data["train"], batch_size=BATCH_SIZE, shuffle=True)
-            states.append(train_local_da_model(global_model, loader, cid, LOCAL_EPOCHS))
-            sizes.append(data["num_train"])
-        global_model.load_state_dict(fedavg(states, sizes))
-        acc, f1, kappa = evaluate_da_global_model(global_model, clients)
-        print(f"DA-PFL Round {rnd+1}/{FED_ROUNDS} | "
-              f"Acc: {acc:.4f} | Macro-F1: {f1:.4f} | Kappa: {kappa:.4f}")
-    return global_model
+            local_states.append(train_local_da(global_model, loader, cid))
+            client_sizes.append(data["num_train"])
+
+        global_model.load_state_dict(fedavg(local_states, client_sizes))
+
+        acc, f1, kappa, _, _ = aggregate_global_eval(
+            global_model,
+            clients,
+            domain_model=True,
+        )
+
+        convergence.append({
+            "method": "DA-PFL pre-personalization",
+            "seed": seed,
+            "round": rnd + 1,
+            "accuracy": acc,
+            "macro_f1": f1,
+            "kappa": kappa,
+        })
+
+        if verbose:
+            print(
+                f"DA-PFL Phase 1 | seed={seed} | round={rnd+1}/{FED_ROUNDS} "
+                f"| acc={acc:.4f} | f1={f1:.4f} | kappa={kappa:.4f}"
+            )
+
+    seed_dir = out_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(global_model.state_dict(), seed_dir / "da_pfl_phase1_grl.pt")
+
+    return global_model, convergence
 
 
-def personalize_da_clients(global_model, clients, fine_tune_epochs=3):
+def personalize_da_pfl(global_model, clients):
     """
-    Phase 2 of DA-PFL: per-client fine-tuning of the global DA model.
+    DA-PFL Phase 2: client-specific fine-tuning without domain loss.
 
-    Continues joint ``L_cls + L_dom`` training with domain labels set to each
-    client's id, using learning rate ``LR * 0.1``.
+    Each client copies the Phase 1 global model and optimizes classification
+    loss only for ``PERSONAL_EPOCHS`` at ``LR * PERSONAL_LR_FACTOR``. Domain
+    logits are discarded in the forward pass — this matches the paper protocol
+    where personalization does not continue adversarial domain training.
 
-    @param global_model: Global DA-PFL model after :func:`run_da_pfl`.
-    @param clients: Client dict from :func:`split_clients`.
-    @param fine_tune_epochs: Personalization epochs per client (default 3).
-    @return: Dict ``client_id → personalized :class:`DomainAdaptiveCNNBiLSTM``.
+    Parameters
+    ----------
+    global_model : DomainAdaptiveCNNBiLSTM
+        Weights after :func:`run_da_pfl_phase1`.
+    clients : dict
+        Per-client train loaders.
+
+    Returns
+    -------
+    dict[int, DomainAdaptiveCNNBiLSTM]
+        Client ID → personalized domain-adaptive model.
     """
     personalized = {}
+
     for cid, data in clients.items():
         model = copy.deepcopy(global_model).to(DEVICE)
         loader = DataLoader(data["train"], batch_size=BATCH_SIZE, shuffle=True)
-        opt         = torch.optim.Adam(model.parameters(), lr=LR * 0.1)
-        cls_loss_fn = nn.CrossEntropyLoss()
-        dom_loss_fn = nn.CrossEntropyLoss()
 
-        for _ in range(fine_tune_epochs):
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR * PERSONAL_LR_FACTOR)
+        criterion = nn.CrossEntropyLoss()
+
+        for ep in range(PERSONAL_EPOCHS):
             model.train()
-            for X_b, y_b in tqdm(loader, desc=f"Personalize cid={cid}", leave=False):
-                X_b = X_b.to(DEVICE)
-                y_b = y_b.to(DEVICE)
-                domain_labels = torch.full(
-                    (X_b.size(0),), int(cid),
-                    dtype=torch.long, device=DEVICE,
-                )
-                opt.zero_grad()
-                class_logits, domain_logits = model(X_b)
-                loss = cls_loss_fn(class_logits, y_b) + dom_loss_fn(domain_logits, domain_labels)
+
+            for X_b, y_b in tqdm(loader, desc=f"DA-PFL Phase2 cid={cid} ep={ep+1}", leave=False):
+                X_b, y_b = X_b.to(DEVICE), y_b.to(DEVICE)
+
+                optimizer.zero_grad()
+                class_logits, _ = model(X_b)
+                loss = criterion(class_logits, y_b)
                 loss.backward()
-                opt.step()
+                optimizer.step()
 
         personalized[cid] = model
+
     return personalized
 
 
-def evaluate_personalized_da_models(models, clients):
+def run_da_pfl(global_model, clients, seed: int, out_dir: Path):
     """
-    Evaluate personalized DA-PFL models on each client's held-out data.
+    DA-PFL Phase 2 evaluation and artifact export.
 
-    @param models: Dict from :func:`personalize_da_clients`.
-    @param clients: Client dict from :func:`split_clients`.
-    @return: Tuple ``(accuracy, macro_f1, kappa)`` pooled over all test sets.
+    Parameters
+    ----------
+    global_model : DomainAdaptiveCNNBiLSTM
+        Model from Phase 1 federated GRL training.
+    clients : dict
+        Client partitions for personalization and testing.
+    seed : int
+        Seed for output paths.
+    out_dir : Path
+        Saves ``da_pfl_client_{cid}.pt`` and ``da_pfl_report.*``.
+
+    Returns
+    -------
+    dict
+        Final result with ``method`` = ``"DA-PFL (ours)"`` and pooled metrics.
     """
-    all_true, all_pred = [], []
+    models = personalize_da_pfl(global_model, clients)
+
+    acc, f1, kappa, y_true, y_pred = evaluate_personalized(
+        models,
+        clients,
+        domain_model=True,
+    )
+
+    seed_dir = out_dir / f"seed_{seed}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+
     for cid, model in models.items():
-        loader = DataLoader(clients[cid]["test"], batch_size=BATCH_SIZE, shuffle=False)
-        _, _, _, yt, yp = evaluate_domain_model(model, loader)
-        all_true.extend(yt); all_pred.extend(yp)
-    return (
-        accuracy_score(all_true, all_pred),
-        f1_score(all_true, all_pred, average="macro"),
-        cohen_kappa_score(all_true, all_pred),
-    )
+        torch.save(model.state_dict(), seed_dir / f"da_pfl_client_{cid}.pt")
+
+    save_classification_report(y_true, y_pred, seed_dir / "da_pfl_report.txt")
+
+    return {
+        "method": "DA-PFL (ours)",
+        "seed": seed,
+        "accuracy": acc,
+        "macro_f1": f1,
+        "kappa": kappa,
+    }
 
 
 # =============================================================================
-# Centralized Baseline
+# Result summarization
 # =============================================================================
-def run_centralized_baseline(X, y):
+
+def summarize_results(results_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Train and evaluate a centralized CNN-BiLSTM upper-bound baseline.
+    Aggregate per-seed results into mean ± std per method.
 
-    Performs a single stratified 80/20 train/test split on the full pooled
-    dataset (ignoring client boundaries), trains for ``CENTRAL_EPOCHS``, and
-    prints a sklearn ``classification_report``.
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Rows from each seed/method with ``accuracy``, ``macro_f1``, ``kappa``.
 
-    @param X: Full feature array from :func:`load_sleep_edf`.
-    @param y: Full label array.
-    @return: Tuple ``(model, accuracy, macro_f1, kappa)`` for the best epoch.
+    Returns
+    -------
+    pd.DataFrame
+        One row per ``method`` with ``*_mean``, ``*_std``, and ``n_seeds``.
+        Uses sample std (``ddof=1``) when more than one seed is present.
     """
-    print("\n========== Centralized CNN-BiLSTM ==========")
-    train_idx, test_idx = train_test_split(
-        np.arange(len(y)), test_size=0.2, random_state=42, stratify=y
-    )
-    train_loader = DataLoader(SleepDataset(X[train_idx], y[train_idx]),
-                              batch_size=BATCH_SIZE, shuffle=True)
-    test_loader  = DataLoader(SleepDataset(X[test_idx],  y[test_idx]),
-                              batch_size=BATCH_SIZE, shuffle=False)
+    rows = []
 
-    model = CNNBiLSTM(num_classes=5).to(DEVICE)
-    opt   = torch.optim.Adam(model.parameters(), lr=LR)
-    crit  = nn.CrossEntropyLoss()
+    for method, group in results_df.groupby("method", sort=False):
+        rows.append({
+            "method": method,
+            "accuracy_mean": group["accuracy"].mean(),
+            "accuracy_std": group["accuracy"].std(ddof=1) if len(group) > 1 else 0.0,
+            "macro_f1_mean": group["macro_f1"].mean(),
+            "macro_f1_std": group["macro_f1"].std(ddof=1) if len(group) > 1 else 0.0,
+            "kappa_mean": group["kappa"].mean(),
+            "kappa_std": group["kappa"].std(ddof=1) if len(group) > 1 else 0.0,
+            "n_seeds": len(group),
+        })
 
-    for epoch in range(CENTRAL_EPOCHS):
-        loss = train_one_epoch(model, train_loader, opt, crit)
-        acc, f1, kappa, _, _ = evaluate(model, test_loader)
-        print(f"Epoch {epoch+1}/{CENTRAL_EPOCHS} | Loss: {loss:.4f} | "
-              f"Acc: {acc:.4f} | Macro-F1: {f1:.4f} | Kappa: {kappa:.4f}")
+    return pd.DataFrame(rows)
 
-    acc, f1, kappa, yt, yp = evaluate(model, test_loader)
-    print("\nCentralized Final Results")
-    print("Accuracy:", acc)
-    print("Macro F1:", f1)
-    print("Cohen Kappa:", kappa)
-    print(classification_report(yt, yp, target_names=[ID_2_LABEL[i] for i in range(5)]))
-    return model, acc, f1, kappa
+
+def format_latex_table(summary_df: pd.DataFrame) -> str:
+    """
+    Format summary statistics as LaTeX table rows for the paper.
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Output of :func:`summarize_results`.
+
+    Returns
+    -------
+    str
+        Newline-separated LaTeX rows: ``method & $acc \\pm std$ & ... \\\\``.
+    """
+    lines = []
+
+    for _, row in summary_df.iterrows():
+        line = (
+            f"{row['method']} & "
+            f"${row['accuracy_mean']:.4f} \\pm {row['accuracy_std']:.4f}$ & "
+            f"${row['macro_f1_mean']:.4f} \\pm {row['macro_f1_std']:.4f}$ & "
+            f"${row['kappa_mean']:.4f} \\pm {row['kappa_std']:.4f}$ \\\\"
+        )
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def compute_delta_rows(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute mean-metric deltas between DA-PFL and baseline methods.
+
+    Comparisons (when both methods exist in ``summary_df``):
+    DA-PFL vs. FedAvg, vs. Personalized FL, vs. Centralized.
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Summarized means from :func:`summarize_results`.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``comparison``, ``delta_accuracy``, ``delta_macro_f1``,
+        ``delta_kappa`` (method A minus method B).
+    """
+    indexed = summary_df.set_index("method")
+    rows = []
+
+    def add_delta(name, method_a, method_b):
+        """Append one pairwise delta row if both methods exist in the summary."""
+        if method_a not in indexed.index or method_b not in indexed.index:
+            return
+        a = indexed.loc[method_a]
+        b = indexed.loc[method_b]
+        rows.append({
+            "comparison": name,
+            "delta_accuracy": a["accuracy_mean"] - b["accuracy_mean"],
+            "delta_macro_f1": a["macro_f1_mean"] - b["macro_f1_mean"],
+            "delta_kappa": a["kappa_mean"] - b["kappa_mean"],
+        })
+
+    add_delta("DA-PFL vs. FedAvg", "DA-PFL (ours)", "FedAvg")
+    add_delta("DA-PFL vs. Pers. FL", "DA-PFL (ours)", "Pers. FL (no DA)")
+    add_delta("DA-PFL vs. Centralized", "DA-PFL (ours)", "Centralized CNN-BiLSTM")
+
+    return pd.DataFrame(rows)
+
+
+def save_experiment_metadata(args, X, y, client_ids, out_dir: Path):
+    """
+    Write reproducibility metadata to ``experiment_metadata.json``.
+
+    Captures hyperparameters, CLI seeds, dataset size, client count, and
+    global class distribution using human-readable stage names from :data:`ID_2_LABEL`.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments (``seeds``, etc.).
+    X : numpy.ndarray
+        Feature array (shape logged via ``num_samples``).
+    y : numpy.ndarray
+        Labels for distribution counts.
+    client_ids : numpy.ndarray
+        Client assignment per epoch.
+    out_dir : Path
+        Output directory; JSON written at ``out_dir/experiment_metadata.json``.
+
+    Returns
+    -------
+    None
+    """
+    labels, counts = np.unique(y, return_counts=True)
+
+    metadata = {
+        "device": DEVICE,
+        "subjects": SUBJECTS,
+        "records": RECORDS,
+        "channel": CHANNEL,
+        "epoch_sec": EPOCH_SEC,
+        "sfreq": SFREQ,
+        "batch_size": BATCH_SIZE,
+        "central_epochs": CENTRAL_EPOCHS,
+        "fed_rounds": FED_ROUNDS,
+        "local_epochs": LOCAL_EPOCHS,
+        "personal_epochs": PERSONAL_EPOCHS,
+        "lr": LR,
+        "personal_lr_factor": PERSONAL_LR_FACTOR,
+        "domain_lambda": DOMAIN_LAMBDA,
+        "seeds": args.seeds,
+        "num_samples": int(len(y)),
+        "num_clients": int(len(np.unique(client_ids))),
+        "class_distribution": {
+            ID_2_LABEL[int(label)]: int(count)
+            for label, count in zip(labels, counts)
+        },
+    }
+
+    (out_dir / "experiment_metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
 # =============================================================================
-# Main
+# Main experiment loop
 # =============================================================================
-def main():
+
+def run_all_experiments(args):
     """
-    End-to-end experiment driver: load data, train all four paradigms, compare.
+    Main experiment driver: load data and run all baselines for each seed.
 
-    Execution order:
-        1. Centralized baseline → save ``models/centralized_cnn_bilstm.pt``
-        2. FedAvg → save ``models/fedavg_sleep_edf.pt``
-        3. Personalized FL (FedAvg + fine-tune)
-        4. DA-PFL (GRL federation + personalization) → save ``models/da_pfl_grl.pt``
+    Pipeline per seed (unless ``--skip-centralized``):
 
-    Prints per-round metrics during training and a final comparison table
-    (accuracy, macro-F1, Cohen's kappa) for all methods.
+    1. Centralized CNN-BiLSTM upper bound
+    2. FedAvg
+    3. Personalized FL (FedAvg + local fine-tuning)
+    4. DA-PFL Phase 1 (GRL) + Phase 2 (classification-only personalization)
 
-    @return: None (results printed to stdout; checkpoints on disk).
+    Writes ``per_seed_results.csv``, ``convergence_curves.csv``,
+    ``summary_mean_std.csv``, ``delta_rows.csv``, and ``latex_table_rows.txt``.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI configuration from :func:`parse_args`.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        ``results_df``, ``summary_df``, ``convergence_df``.
     """
-    os.makedirs("models", exist_ok=True)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Downloading and preprocessing Sleep-EDF...")
+    print(f"Device: {DEVICE}")
+    print("Loading Sleep-EDF data. This may download the dataset the first time.")
     X, y, client_ids = load_sleep_edf()
-    print("Data shape:", X.shape)
-    print("Labels:", np.unique(y, return_counts=True))
-    print("Number of clients:", len(np.unique(client_ids)))
-
-    results = {}
-
-    # 1. Centralized upper bound
-    centralized_model, acc, f1, kappa = run_centralized_baseline(X, y)
-    results["Centralized CNN-BiLSTM"] = (acc, f1, kappa)
-    torch.save(centralized_model.state_dict(), "models/centralized_cnn_bilstm.pt")
-
-    clients = split_clients(X, y, client_ids)
-
-    # 2. Standard FedAvg
-    fedavg_model = run_fedavg(clients)
-    acc, f1, kappa = evaluate_global_model(fedavg_model, clients)
-    results["FedAvg"] = (acc, f1, kappa)
-    torch.save(fedavg_model.state_dict(), "models/fedavg_sleep_edf.pt")
-
-    # 3. Personalized FL (FedAvg global + client fine-tune, no domain adapt.)
-    pers_models = personalize_clients(fedavg_model, clients, PERSONAL_EPOCHS)
-    acc, f1, kappa = evaluate_personalized_models(pers_models, clients)
-    results["Personalized FL (no DA)"] = (acc, f1, kappa)
-
-    # 4. DA-PFL: GRL-based adversarial domain adaptation + personalization
     num_domains = len(np.unique(client_ids))
-    da_model = run_da_pfl(clients, num_domains)
 
-    pers_da_models = personalize_da_clients(da_model, clients, PERSONAL_EPOCHS)
-    acc, f1, kappa = evaluate_personalized_da_models(pers_da_models, clients)
-    results["DA-PFL (GRL + Personalization)"] = (acc, f1, kappa)
-    torch.save(da_model.state_dict(), "models/da_pfl_grl.pt")
+    print(f"Data shape: {X.shape}")
+    print(f"Labels: {dict(zip(*np.unique(y, return_counts=True)))}")
+    print(f"Number of clients: {num_domains}")
 
-    # Summary
-    print("\n========== Final Comparison ==========")
-    print(f"{'Model':<45} | {'Accuracy':>10} | {'Macro-F1':>10} | {'Kappa':>10}")
-    print("-" * 90)
-    for name, (acc, f1, kappa) in results.items():
-        print(f"{name:<45} | {acc:.4f}     | {f1:.4f}     | {kappa:.4f}")
+    save_experiment_metadata(args, X, y, client_ids, out_dir)
+
+    all_results = []
+    all_convergence = []
+
+    for seed in args.seeds:
+        print("\n" + "=" * 80)
+        print(f"Running seed {seed}")
+        print("=" * 80)
+
+        set_seed(seed)
+        clients = split_clients(X, y, client_ids, seed=seed)
+
+        if not args.skip_centralized:
+            print("\n[1/4] Centralized CNN-BiLSTM")
+            central_result = run_centralized(
+                X,
+                y,
+                seed=seed,
+                out_dir=out_dir,
+                verbose=args.verbose,
+            )
+            all_results.append(central_result)
+
+        print("\n[2/4] FedAvg")
+        fedavg_model, fedavg_result, fedavg_curve = run_fedavg(
+            clients,
+            seed=seed,
+            out_dir=out_dir,
+            verbose=args.verbose,
+        )
+        all_results.append(fedavg_result)
+        all_convergence.extend(fedavg_curve)
+
+        print("\n[3/4] Personalized FL")
+        pers_result = run_personalized_fl(
+            fedavg_model,
+            clients,
+            seed=seed,
+            out_dir=out_dir,
+        )
+        all_results.append(pers_result)
+
+        print("\n[4/4] DA-PFL")
+        da_phase1_model, da_curve = run_da_pfl_phase1(
+            clients,
+            seed=seed,
+            num_domains=num_domains,
+            out_dir=out_dir,
+            verbose=args.verbose,
+        )
+        all_convergence.extend(da_curve)
+
+        da_result = run_da_pfl(
+            da_phase1_model,
+            clients,
+            seed=seed,
+            out_dir=out_dir,
+        )
+        all_results.append(da_result)
+
+        seed_df = pd.DataFrame([r for r in all_results if r["seed"] == seed])
+        print("\nSeed summary:")
+        print(seed_df[["method", "accuracy", "macro_f1", "kappa"]].to_string(index=False))
+
+    results_df = pd.DataFrame(all_results)
+    convergence_df = pd.DataFrame(all_convergence)
+
+    results_df.to_csv(out_dir / "per_seed_results.csv", index=False)
+    convergence_df.to_csv(out_dir / "convergence_curves.csv", index=False)
+
+    summary_df = summarize_results(results_df)
+    summary_df.to_csv(out_dir / "summary_mean_std.csv", index=False)
+
+    delta_df = compute_delta_rows(summary_df)
+    delta_df.to_csv(out_dir / "delta_rows.csv", index=False)
+
+    latex_rows = format_latex_table(summary_df)
+    (out_dir / "latex_table_rows.txt").write_text(latex_rows)
+
+    print("\n" + "=" * 80)
+    print("FINAL MULTI-SEED SUMMARY")
+    print("=" * 80)
+    print(summary_df.to_string(index=False))
+
+    print("\n" + "=" * 80)
+    print("DELTA ROWS")
+    print("=" * 80)
+    print(delta_df.to_string(index=False))
+
+    print("\n" + "=" * 80)
+    print("LATEX TABLE ROWS")
+    print("=" * 80)
+    print(latex_rows)
+
+    print(f"\nSaved results to: {out_dir.resolve()}")
+
+    return results_df, summary_df, convergence_df
+
+
+def parse_args():
+    """
+    Define and parse command-line arguments for the experiment suite.
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments with attributes:
+
+        - ``seeds`` : list[int], default ``DEFAULT_SEEDS``
+        - ``out_dir`` : str, default ``"paper_results"``
+        - ``skip_centralized`` : bool
+        - ``verbose`` : bool
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run sleep-stage FL experiments: Centralized, FedAvg, "
+            "Personalized FL, and DA-PFL with multi-seed reporting."
+        ),
+    )
+
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=DEFAULT_SEEDS,
+        help="Random seeds for multi-seed evaluation.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="paper_results",
+        help="Directory to save results and checkpoints.",
+    )
+    parser.add_argument(
+        "--skip-centralized",
+        action="store_true",
+        help="Skip centralized baseline to save runtime.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print epoch/round metrics.",
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    # Entry point: parse CLI flags and run the full paper experiment loop.
+    args = parse_args()
+    run_all_experiments(args)
