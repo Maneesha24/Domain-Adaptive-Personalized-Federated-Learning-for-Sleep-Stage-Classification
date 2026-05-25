@@ -4,7 +4,7 @@
 
 PyTorch implementation of **Domain-Adaptive Personalized Federated Learning (DA-PFL)** for sleep stage classification on [Sleep-EDF Cassette](https://physionet.org/content/sleep-edfx/1.0.0/). Compares centralized training, FedAvg, personalized FL, and GRL-based domain-adaptive FL with a shared **CNN-BiLSTM** backbone.
 
-**Paper:** [`Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf`](Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf)
+**Conference Paper:** [`Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf`](Personalized_Federated_Learning_for_Sleep_Stage_Classification.pdf)
 
 ---
 
